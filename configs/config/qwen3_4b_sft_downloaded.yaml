@@ -1,0 +1,104 @@
+# Direct SFT from the community Qwen3-8B teacher dataset.
+# Training hyperparameters follow Lightning OPD Appendix B, Table 5 (4B).
+# The uploader did not disclose the exact teacher checkpoint revision.
+model_path: Qwen/Qwen3-4B-Base
+teacher_model_path: Qwen/Qwen3-8B
+hf_home: /scratch/l/luli/hf
+local_models_only: true
+python_executable: /scratch/l/luli/conda/envs/verl/bin/python
+# SFT-only packages are archived to conserve scratch inodes, then extracted
+# to node-local /tmp. Shared PyTorch/CUDA come from the existing verl.
+sft_dependency_archive: /scratch/l/luli/src/Lightning-OPD/.runtime/sft/packages.tar.gz
+generation_python: /scratch/l/luli/conda/envs/verl/bin/python
+cuda_home: /cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Core/cudacore/12.6.2
+env_file: .env
+use_wandb: true
+wandb_mode: offline
+wandb_entity: li-jiang-opd
+project_name: onestep-opd
+experiment_name: qwen3_4b_sft_qwen3_8b_community300k
+output_dir: /scratch/l/luli/results/onestep/model
+
+# Source prompt settings are retained for recipe comparison; direct SFT skips prompt extraction and generation.
+source_dataset: open-thoughts/OpenThoughts3-1.2M
+source_revision: 61bcf9d4eb38b30295efc2021227a63cc5bb34c8
+source_data_dir: /scratch/l/luli/data/lightning_opd/sft/source/OpenThoughts3-1.2M
+download_workers: 8
+prompt_preparation_workers: 4
+num_sft_prompts: 300000
+seed: 42
+prompts_file: /scratch/l/luli/data/lightning_opd/sft/openthoughts3_300k_prompts.parquet
+generation_dir: /scratch/l/luli/data/lightning_opd/sft/qwen3_8b_responses
+train_files: /scratch/l/luli/data/lightning_opd/sft/community/openthoughts3_300000_qwen3-8b.parquet
+
+# Uploader sampling settings, retained as provenance; no generation runs in this job.
+teacher_tensor_parallel_size: 1
+generation_batch_size: 32
+# Compact every 1024 responses; retain at most 31 small batch files per worker
+# between checkpoints, avoiding 9384 files against the scratch inode quota.
+generation_shard_size: 1024
+generation_temperature: 0.7
+generation_top_p: 0.9
+generation_max_tokens: 16384
+teacher_max_model_len: 40960
+teacher_gpu_memory_utilization: 0.9
+generation_attention_backend: FLASH_ATTN
+
+# 2 nodes x 4 H100. Original recipe: 32 GPUs x 4 x 2 = 256.
+# Here: 8 GPUs x 4 x 8 = 256, preserving the paper's optimizer batch size.
+nnodes: 2
+n_gpus_per_node: 4
+global_batch_size: 256
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+master_port: 29503
+
+# LlamaFactory full SFT, core hyperparameters from Table 5.
+# ZeRO-2 shards optimizer/gradient state to fit 8 H100s; the paper used ZeRO-0.
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed_stage: 2
+enable_liger_kernel: true
+packing: true
+template: qwen3
+cutoff_len: 16384
+learning_rate: 8.0e-5
+max_steps: 3000
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+flash_attn: fa2
+gradient_checkpointing: true
+optim: adamw_torch
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+weight_decay: 0.0
+max_grad_norm: 1.0
+train_on_prompt: false
+preprocessing_num_workers: 16
+dataloader_persistent_workers: true
+dataloader_pin_memory: true
+dataloader_num_workers: 4
+logging_steps: 1
+save_strategy: "no"  # Full checkpoints only at the walltime deadline or max_steps.
+save_total_limit: 1  # Save the next full checkpoint before deleting the previous one.
+save_only_model: false
+plot_loss: true
+overwrite_cache: true
+overwrite_output_dir: false
+ddp_timeout: 180000000
+resume: true
+
+# Before the allocation expires, save a full training checkpoint and exit.
+# Resubmit the direct-SFT sbatch to continue.
+walltime_checkpoint_margin_seconds: 1200
+
+# Public community data, pinned to the dataset repository commit and LFS hash.
+sft_data_source: huggingface
+sft_dataset_repo: oldpilluwu/openthoughts3-qwen3-8b-300k
+sft_dataset_revision: 1f3b91877703992463cb7d61240fd88831b40188
+sft_dataset_filename: openthoughts3_300000_qwen3-8b.parquet
+sft_dataset_size_bytes: 4713439990
+sft_dataset_sha256: 6de6a0d6b2573e53c3a9b380d3954e5c6fe1d05057b3cf903ea8bbb08f621393

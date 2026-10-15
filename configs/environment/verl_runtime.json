@@ -1,0 +1,64 @@
+{
+  "validated_on": "2026-10-09",
+  "validation_job": 514689,
+  "python": "/scratch/l/luli/conda/envs/verl/bin/python",
+  "versions": {
+    "torch": "2.9.0",
+    "sglang": "0.5.6",
+    "sglang-router": "0.3.1",
+    "sgl-kernel": "0.3.18.post2",
+    "torch-memory-saver": "0.0.9",
+    "megatron-core": "0.14.0",
+    "mbridge": "0.13.1"
+  },
+  "torch_cuda": "12.8",
+  "megatron_commit": "23e00ed0963c35382dfe8a5a94fb3cda4d21e133",
+  "megatron_patch": "configs/environment/megatron-core-v0.14-no-mtp.patch",
+  "attention_backend": "fused",
+  "validation_allocation": {
+    "nodes": 1,
+    "h100_per_node": 4
+  },
+  "training_smoke": {
+    "tensor_parallel": 2,
+    "data_parallel": 2,
+    "steps": 1,
+    "training_examples": 2,
+    "evaluation_examples": 2,
+    "max_response_tokens": 32,
+    "loss": 1.6994529962539673,
+    "grad_norm": 388.3724050444367,
+    "saved_rollout_id": 0
+  },
+  "passed_checks": [
+    "native runtime imports",
+    "SGLang, FlashAttention and Transformer Engine CUDA kernels on all four GPUs",
+    "packed GQA attention forward and backward",
+    "TorchMemorySaver offload and resume",
+    "Qwen3-4B student generation",
+    "Qwen3-8B teacher logprob scoring and parquet validation",
+    "distributed HF to Megatron checkpoint conversion",
+    "Ray model loading and weight synchronization",
+    "initial evaluation using opd-baselines scoring",
+    "OPD gradient and optimizer update",
+    "training checkpoint save",
+    "final evaluation after updating inference weights"
+  ],
+  "report": ".runtime/verl/checks/514689/passed.json",
+  "log": ".runtime/verl/interactive-514689.log",
+  "production_allocation": {
+    "nodes": 2,
+    "h100_per_node": 4,
+    "time": "08:00:00"
+  },
+  "production_training_started": false,
+  "two_node_gpu_validation_performed": false,
+  "pip_check_clean": false,
+  "megatron_source": "/scratch/l/luli/src/Lightning-OPD/.runtime/verl/src/Megatron-LM",
+  "prepared_data_root": "/scratch/l/luli/data/lightning_opd",
+  "artifact_relocation": {
+    "original_runtime_root": "/scratch/l/luli/src/Lightning-OPD/data/runtime",
+    "runtime_root": "/scratch/l/luli/src/Lightning-OPD/.runtime",
+    "new_gpu_validation_performed": false
+  }
+}

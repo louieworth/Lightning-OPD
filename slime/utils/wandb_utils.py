@@ -6,6 +6,8 @@ import os
 from copy import deepcopy
 
 import wandb
+from .wandb_metrics import EVAL_STEP_METRIC
+from .wandb_run_ids import resolve_wandb_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ def init_wandb_primary(args):
     resume_run_id = getattr(args, "wandb_resume_run_id", None) or getattr(args, "wandb_run_id", None)
     if not resume_run_id:
         resume_run_id = _load_wandb_run_id_from_checkpoint(args)
+    resume_run_id = resolve_wandb_run_id(resume_run_id, args.wandb_team, args.wandb_project)
     
     if resume_run_id:
         # Resume an existing run
@@ -62,9 +65,9 @@ def init_wandb_primary(args):
         
         # Configure settings based on offline/online mode
         if offline:
-            init_kwargs["settings"] = wandb.Settings(mode="offline")
+            init_kwargs["settings"] = wandb.Settings(mode="offline", x_disable_stats=True)
         else:
-            init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True)
+            init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True, x_disable_stats=True)
     else:
         # Create a new run
         # add random 6 length string with characters
@@ -88,9 +91,9 @@ def init_wandb_primary(args):
 
         # Configure settings based on offline/online mode
         if offline:
-            init_kwargs["settings"] = wandb.Settings(mode="offline")
+            init_kwargs["settings"] = wandb.Settings(mode="offline", x_disable_stats=True)
         else:
-            init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True)
+            init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True, x_disable_stats=True)
 
     # Add custom directory if specified
     if args.wandb_dir:
@@ -164,12 +167,13 @@ def init_wandb_secondary(args, router_addr=None):
 
     # Configure settings based on offline/online mode
     if offline:
-        settings_kwargs = dict(mode="offline")
+        settings_kwargs = dict(mode="offline", x_disable_stats=True)
     else:
         settings_kwargs = dict(
             mode="shared",
             x_primary=False,
             x_update_finish_state=False,
+            x_disable_stats=True,
         )
 
     if args.sglang_enable_metrics and router_addr is not None:
@@ -210,9 +214,8 @@ def _init_wandb_common():
     wandb.define_metric("rollout/*", step_metric="rollout/step")
     wandb.define_metric("multi_turn/*", step_metric="rollout/step")
     wandb.define_metric("passrate/*", step_metric="rollout/step")
-    wandb.define_metric("eval/step")
-    wandb.define_metric("eval/*", step_metric="eval/step")
-    wandb.define_metric("perf/*", step_metric="rollout/step")
+    wandb.define_metric(EVAL_STEP_METRIC, hidden=True)
+    wandb.define_metric("eval_metric/*", step_metric=EVAL_STEP_METRIC, step_sync=False)
 
 
 def get_wandb_offline_dir(args):

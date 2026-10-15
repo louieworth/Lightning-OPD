@@ -114,24 +114,42 @@ class RolloutManager:
             else:
                 self.num_new_engines = 0
 
-    def eval(self, rollout_id):
+    def eval(self, rollout_id, completed_steps=None):
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
 
         # TODO: add fault tolerance to eval
+        self.args.eval_completed_steps = completed_steps if completed_steps is not None else (
+            0 if rollout_id == 0 else rollout_id + 1)
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
-        metrics = _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        metrics = _log_eval_rollout_data(rollout_id, self.args, data, result.metrics,
+                                       completed_steps=self.args.eval_completed_steps)
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
 
     def save(self, rollout_id):
+        if getattr(self.args, "lightning_block_config", None):
+            self.data_source.metadata["lightning_global_sample_offset"] = (rollout_id + 1) * self.args.rollout_batch_size
         self.data_source.save(rollout_id)
 
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
+
+    def lightning_resume_metadata(self):
+        return dict(self.data_source.metadata)
+
+    def prepare_lightning_block(self, index, policy_id):
+        from slime.rollout.lightning_opd_blocks import prepare_student_block
+
+        return prepare_student_block(self, index, policy_id)
+
+    def load_lightning_block(self, index, rollout_id, policy_id):
+        from slime.rollout.lightning_opd_blocks import load_training_block
+
+        return load_training_block(self, index, rollout_id, policy_id)
 
     def offload(self):
         return ray.get([engine.release_memory_occupation.remote() for engine in self.rollout_engines])
@@ -282,6 +300,8 @@ class RolloutManager:
 
         if "teacher_log_probs" in samples[0].__dict__:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+        if "teacher_features" in samples[0].__dict__:
+            train_data["teacher_features"] = [sample.teacher_features for sample in samples]
 
         if "verifiable_rewards" in samples[0].__dict__:
             train_data["verifiable_rewards"] = [
@@ -327,6 +347,7 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_features",
                 "verifiable_rewards",
             ]:
                 if key not in data:
@@ -447,9 +468,6 @@ def _allocate_rollout_engine_addr_and_ports_normal(*, args, num_engines, rollout
     # 2. nccl port
     # 3. dist_init_addr port
     # 4. other ports for dp_attention, which is of size 4 + dp_size
-    num_engines_per_node = max(
-        1, min(args.num_gpus_per_node, args.rollout_num_gpus) // args.rollout_num_gpus_per_engine
-    )
     addr_and_ports = [{} for _ in range(num_engines)]
 
     # Calculate prefill limit to identify prefill engines
@@ -458,58 +476,36 @@ def _allocate_rollout_engine_addr_and_ports_normal(*, args, num_engines, rollout
         num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
         prefill_limit = args.prefill_num_servers * args.rollout_num_gpus_per_engine // num_gpu_per_engine
 
-    visited_nodes = set()
+    # Actor/teacher reservations can leave different numbers of rollout GPUs on
+    # each node. Query each actor's actual host instead of grouping engine ranks
+    # into assumed full nodes. Keep one allocation cursor per physical host.
+    next_port_by_host = {}
     for rank, engine in rollout_engines:
-        if rank // num_engines_per_node in visited_nodes:
-            continue
-        visited_nodes.add(rank // num_engines_per_node)
-        # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
-        # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
-        num_engines_on_this_node = num_engines_per_node - (rank % num_engines_per_node)
+        host, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
 
-        def get_addr_and_ports(engine):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = 15000
-
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                    )
+        def get_port(consecutive=1):
+            _, port = ray.get(
+                engine._get_current_node_ip_and_free_port.remote(
+                    start_port=next_port_by_host.get(host, 15000), consecutive=consecutive,
                 )
-                start_port = port + consecutive
-                return port
+            )
+            next_port_by_host[host] = port + consecutive
+            return port
 
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
-
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-            if args.prefill_num_servers is not None and current_rank < prefill_limit:
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
+        ports = addr_and_ports[rank]
+        ports.update(host=host, port=get_port(), nccl_port=get_port())
+        if args.prefill_num_servers is not None and rank < prefill_limit:
+            ports["disaggregation_bootstrap_port"] = get_port()
 
         if args.rollout_num_gpus_per_engine > args.num_gpus_per_node:
             num_node_per_engine = args.rollout_num_gpus_per_engine // args.num_gpus_per_node
             if rank % num_node_per_engine == 0:
                 # this is the first node in the engine, we need to allocate the dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
+                dist_init_addr = f"{_wrap_ipv6(host)}:{get_port(30 + args.sglang_dp_size)}"
                 for i in range(num_node_per_engine):
                     addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
         else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
+            ports["dist_init_addr"] = f"{_wrap_ipv6(host)}:{get_port(30 + args.sglang_dp_size)}"
 
     for i, _ in rollout_engines:
         for key in ["port", "nccl_port", "dist_init_addr"]:
@@ -570,16 +566,22 @@ def _start_router(args):
     logger.info(f"Router launched at {args.sglang_router_ip}:{args.sglang_router_port}")
 
 
-def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
+def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None,
+                         completed_steps=None):
     if args.custom_eval_rollout_log_function_path is not None:
         custom_log_func = load_function(args.custom_eval_rollout_log_function_path)
         if custom_log_func(rollout_id, args, data, extra_metrics):
             return
 
-    log_dict = extra_metrics or {}
+    log_dict = dict(extra_metrics or {})
     for key in data.keys():
         rewards = data[key]["rewards"]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        # Prefer the evaluator's per-question Avg@1 over the sample reward mean.
+        avg_at_one = log_dict.pop(f"eval/{key}/avg@1", None)
+        if avg_at_one is None:
+            avg_at_one = sum(rewards) / len(rewards)
+        log_dict[f"eval_metric/{key}-avg@1"] = avg_at_one
+        log_dict.pop(f"eval/{key}", None)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
@@ -596,8 +598,11 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
 
     logger.info(f"eval {rollout_id}: {log_dict}")
 
-    step = compute_rollout_step(args, rollout_id)
+    if completed_steps is None:
+        completed_steps = 0 if rollout_id == 0 else rollout_id + 1
+    step = compute_rollout_step(args, completed_steps)
     log_dict["eval/step"] = step
+    log_dict["eval_step"] = step
     tracking_utils.log(args, log_dict, step_key="eval/step")
 
     return log_dict

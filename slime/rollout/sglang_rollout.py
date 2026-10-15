@@ -26,6 +26,7 @@ from slime.utils.mask_utils import get_response_lengths, MultiTurnLossMaskGenera
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import encode_image_for_rollout_engine, load_processor, load_tokenizer
 from slime.utils.types import Sample
+from slime.utils.walltime import CheckpointDeadlineReached, evaluation_before_deadline
 
 from .rm_hub import async_rm, batched_async_rm
 
@@ -533,7 +534,18 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     coros = []
     for dataset_cfg in getattr(args, "eval_datasets", []) or []:
         coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
-    results_list = await asyncio.gather(*coros)
+    try:
+        results_list = await evaluation_before_deadline(
+            asyncio.gather(*coros), getattr(args, "checkpoint_deadline", None)
+        )
+    except CheckpointDeadlineReached:
+        # Cancel the server requests as well as their local HTTP tasks before
+        # the driver offloads inference and restores the training workers.
+        try:
+            await asyncio.wait_for(abort(args, rollout_id), timeout=30)
+        except Exception:
+            logger.warning("Could not abort all evaluation requests before checkpointing.", exc_info=True)
+        raise
     results = {}
     for r in results_list:
         results.update(r)
@@ -613,21 +625,27 @@ async def eval_rollout_single_dataset(
     data = []
     do_print = True
     pbar = tqdm(total=len(tasks), desc="Rollout generation", disable=not do_print)
-    for coro in asyncio.as_completed(tasks):
-        sample = await coro
-        if do_print:
-            logger.info(
-                "eval_rollout_single_dataset example data: "
-                f"{[str(sample.prompt) + sample.response]} "
-                f"reward={sample.reward}"
-            )
-            do_print = False
-        if isinstance(sample, list):
-            data.extend(sample)
-        else:
-            data.append(sample)
-        pbar.update(1)
-    pbar.close()
+    try:
+        for coro in asyncio.as_completed(tasks):
+            sample = await coro
+            if do_print:
+                logger.info(
+                    "eval_rollout_single_dataset example data: "
+                    f"{[str(sample.prompt) + sample.response]} "
+                    f"reward={sample.reward}"
+                )
+                do_print = False
+            if isinstance(sample, list):
+                data.extend(sample)
+            else:
+                data.append(sample)
+            pbar.update(1)
+    finally:
+        pbar.close()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     data.sort(key=lambda sample: sample.index)
 

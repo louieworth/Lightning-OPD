@@ -1,0 +1,21 @@
+{
+  "python_executable": "/scratch/l/luli/conda/envs/verl/bin/python",
+  "dependency_archive": "/scratch/l/luli/src/Lightning-OPD/.runtime/sft/packages.tar.gz",
+  "dependency_archive_sha256": "6df0988fb9709fadbd57b29fa5256414aac71e7ddcf4f1203c8e3752316f4f3c",
+  "base_packages": {
+    "torch": "2.9.0",
+    "transformers": "4.57.6+computecanada",
+    "flash-attn": "2.8.3",
+    "liger-kernel": "0.8.0"
+  },
+  "sft_packages": {
+    "llamafactory": "0.9.5",
+    "deepspeed": "0.19.7",
+    "datasets": "4.0.0",
+    "accelerate": "1.11.0",
+    "peft": "0.18.1",
+    "trl": "0.24.0"
+  },
+  "validation_scope": "package metadata and CPU imports only; no GPU test allocation submitted",
+  "cpu_training_entry_import_verified": true
+}

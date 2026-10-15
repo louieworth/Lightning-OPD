@@ -14,6 +14,8 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.utils.opd_config import option
+from slime.utils.opd_loss import sampled_advantage
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -63,7 +65,8 @@ def get_responses(
     assert logits.dtype == torch.float32, f"{logits.dtype}"
 
     logits = logits.squeeze(0)
-    logits = logits.div(args.rollout_temperature)
+    if args.rollout_temperature != 1.0:
+        logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
     end = 0
@@ -306,7 +309,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         ]
 
         advantages = [
-            teacher_log_prob - student_log_prob
+            sampled_advantage(teacher_log_prob, student_log_prob,
+                              option(args, "opd_log_prob_min_clip", None), option(args, "opd_loss_max_clip", None))
             for teacher_log_prob, student_log_prob in zip(teacher_log_probs, student_log_probs, strict=False)
         ]
 
@@ -452,6 +456,8 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
+    if args.advantage_estimator == "on_policy_distillation" and option(args, "opd_loss_token_mode", "sample") != "sample":
+        return opd_distribution_loss_function(args, batch, logits, sum_of_sample_mean)
     advantages = torch.cat(batch["advantages"], dim=0)
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
 
@@ -626,6 +632,43 @@ def policy_loss_function(
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
 
     return loss, reported_loss
+
+
+def get_opd_distribution_losses(args, batch, logits):
+    from .opd import compute_distribution_losses
+
+    # get_responses normally divides the entire packed logits tensor by temperature.
+    # Here temperature is applied per chunk to avoid a second full-size allocation.
+    raw_args = Namespace(**vars(args))
+    raw_args.rollout_temperature = 1.0
+    responses = get_responses(logits, args=raw_args, unconcat_tokens=batch["unconcat_tokens"],
+                              total_lengths=batch["total_lengths"], response_lengths=batch["response_lengths"])
+    return compute_distribution_losses(args, batch, logits, responses)
+
+
+def opd_distribution_loss_function(args, batch, logits, sum_of_sample_mean):
+    losses = get_opd_distribution_losses(args, batch, logits)
+    distillation_loss = sum_of_sample_mean(losses)
+    loss = distillation_loss
+    reported = {"opd/distillation_loss": distillation_loss.detach()}
+    if args.entropy_coef or (args.use_kl_loss and args.kl_loss_coef):
+        output = get_log_probs_and_entropy(logits, args=args, unconcat_tokens=batch["unconcat_tokens"],
+                                          total_lengths=batch["total_lengths"], response_lengths=batch["response_lengths"],
+                                          with_entropy=bool(args.entropy_coef))
+        if args.entropy_coef:
+            entropy = sum_of_sample_mean(torch.cat(output["entropy"]))
+            loss = loss - args.entropy_coef * entropy
+            reported["entropy_loss"] = entropy.detach()
+        if args.use_kl_loss and args.kl_loss_coef:
+            log_probs = torch.cat(output["log_probs"])
+            ref_log_probs = torch.cat(batch["ref_log_probs"])
+            old_log_probs = torch.cat(batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"])
+            ratio = (log_probs - old_log_probs).exp() if args.use_unbiased_kl else None
+            kl = sum_of_sample_mean(compute_approx_kl(log_probs, ref_log_probs, args.kl_loss_type, ratio))
+            loss = loss + args.kl_loss_coef * kl
+            reported["kl_loss"] = kl.detach()
+    reported["loss"] = loss.detach()
+    return loss, reported
 
 
 def value_loss_function(

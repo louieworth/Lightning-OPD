@@ -8,6 +8,7 @@ build/
 
 # Logs
 *.log
+/tmp/
 
 # IDE
 .vscode/
@@ -20,8 +21,14 @@ build/
 
 # Project-specific
 data/
+.runtime/
 checkpoints/
 *.arrow
 *.sqsh
 *.parquet
 wandb/
+
+# Local credentials; example templates may be committed.
+.env
+.env.*
+!.env.example

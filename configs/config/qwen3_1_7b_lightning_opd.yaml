@@ -1,0 +1,164 @@
+# Qwen3-1.7B Lightning OPD. Launcher keys follow the opd-baselines naming;
+# training keys map directly to slime flags (underscore -> hyphen).
+method: lightning_opd
+# Student initialization: HuggingFace model ID or local HF model directory.
+model_path: Qwen/Qwen3-1.7B-Base
+teacher_model_path: Qwen/Qwen3-8B
+model_type: qwen3-1.7B
+local_models_only: true
+hf_home: /scratch/l/luli/hf
+auto_prepare_model: true
+conversion_num_gpus: 4
+
+# Existing verl environment extended with the Lightning OPD runtime.
+python_executable: /scratch/l/luli/conda/envs/verl/bin/python
+# Full Megatron-LM v0.14.0 training source (pip megatron-core alone lacks training).
+megatron_path: /scratch/l/luli/src/Lightning-OPD/.runtime/verl/src/Megatron-LM
+# Compiler for FlashInfer JIT; PyTorch retains its own CUDA 12.8 runtime libraries.
+cuda_home: /cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Core/cudacore/12.6.2
+# Local credentials; relative env_file paths are resolved from the repo root.
+env_file: .env
+use_wandb: true
+wandb_mode: offline
+wandb_entity: li-jiang-opd
+project_name: onestep-opd
+experiment_name: qwen3_1_7b_lightning_opd_base_k1  # Use a new name when changing K.
+output_dir: /scratch/l/luli/results/lightning-opd
+resume: auto  # Resume a present training checkpoint; otherwise start from the base model.
+
+# Cluster allocation: 2 nodes x 4 H100s (8 total); sbatch wall time is 6 hours.
+nnodes: 2
+n_gpus_per_node: 4
+startup_timeout: 3600
+actor_num_nodes: 2
+actor_num_gpus_per_node: 4
+# Student inference engines share actor GPUs for block rollouts and evaluation.
+# Actor/inference memory is offloaded before each block's temporary teacher scoring.
+colocate: true
+rollout_num_gpus: 8
+rollout_num_gpus_per_engine: 1
+sglang_mem_fraction_static: 0.4
+# Bound 16k-token evaluation requests; the upstream default is 512 per engine.
+sglang_server_concurrency: 8
+sglang_max_running_requests: 8
+router_policy: round_robin  # Spread long evaluation requests across all engines.
+# Training intentionally offloads workers. Keep health checks, but avoid opening
+# every circuit during memory/weight transitions and recover healthy workers quickly.
+router_disable_circuit_breaker: true
+router_health_check_timeout_secs: 30
+router_health_check_interval_secs: 10
+router_health_success_threshold: 1
+
+# The default sbatch builds the fixed prompt sequence, then alternates K times:
+# current-policy student rollout -> cached teacher logprobs -> block training.
+# Prepared parquet inputs live outside the checkout under /scratch/l/luli/data/lightning_opd/.
+# Rebuild with: python configs/lightning_opd/qwen3-4b-lightning-opd.py --config configs/config/qwen3_1_7b_lightning_opd.yaml --prepare-prompts
+source_data_dir: /scratch/l/luli/data
+train_files: /scratch/l/luli/data/lightning_opd/train/dapo_math_17k.parquet
+max_train_samples: 100000
+# null -> <output_dir>/<experiment_name>/data/fixed_prompts.parquet
+# Exactly num_rollout * rollout_batch_size rows, repeating shuffled DAPO decks.
+# This prompt order is independent of K; responses/logprobs are cached per block.
+lightning_fixed_data: null
+input_key: prompt
+label_key: label
+metadata_key: metadata
+# Offline prompts are already rendered; never apply a second chat template.
+apply_chat_template: false
+apply_chat_template_kwargs: {enable_thinking: true}
+rollout_shuffle: false  # Keep fixed absolute positions; the builder shuffles DAPO decks.
+rollout_seed: 42
+seed: 42
+num_rollout: 150  # README convergence setting; set 3000 to match the original launcher limit.
+policy_rollout_k: 1  # Integer in [1, num_rollout]; number of current-policy rollout blocks.
+rollout_batch_size: 256
+n_samples_per_prompt: 1
+rollout_max_prompt_len: 2048
+rollout_max_response_len: 4096
+rollout_temperature: 0.8
+rollout_top_p: 1.0
+rollout_top_k: -1
+global_batch_size: 256
+balance_data: false
+
+# One-node CPU preparation builds the fixed 38,400-row sequence before training.
+# Each block uses current Ray student engines; teacher scoring temporarily uses 2 GPUs.
+precompute_concurrency: 32
+precompute_port: 13142
+precompute_tp_size: 2  # Legacy preparer only; block rollouts use rollout_num_gpus_per_engine.
+teacher_num_gpus: 2  # Teacher scoring is temporary; all 8 GPUs remain available for training.
+teacher_tp_size: 2
+teacher_port: 13141
+teacher_mem_fraction_static: 0.6
+teacher_context_length: 32768
+teacher_chunked_prefill_size: 4096
+teacher_url: null
+
+custom_rm_path: slime.rollout.on_policy_distillation.reward_func
+custom_reward_post_process_path: slime.rollout.on_policy_distillation.post_process_rewards
+include_verifiable_reward: true
+advantage_estimator: on_policy_distillation
+use_kl_loss: true
+kl_loss_coef: 0.0
+kl_loss_type: low_var_kl
+entropy_coef: 0.0
+# Vocabulary support for reverse-KL distillation; independent of policy_rollout_k.
+opd_loss_token_mode: sample  # sample | top_k_student | top_k_teacher | full_vocab
+opd_token_top_k: 32  # Vocabulary candidates, NOT the number of policy rollout blocks.
+opd_distribution_chunk_size: 32  # Bound dense-logit reconstruction/gather memory.
+opd_loss_max_clip: 10.0  # sample: advantage +/-10; distribution modes: per-position KL <=10.
+opd_log_prob_min_clip: -10.0  # sample only; null disables this logprob floor.
+# Distribution loss caches teacher hidden states and a frozen output head on shared disk.
+optimizer: adam
+lr: 2.0e-6
+lr_decay_style: constant
+weight_decay: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.98
+
+tensor_model_parallel_size: 2
+sequence_parallel: true
+pipeline_model_parallel_size: 1
+context_parallel_size: 1
+expert_model_parallel_size: 1
+expert_tensor_parallel_size: 1
+recompute_granularity: full
+recompute_method: uniform
+recompute_num_layers: 1
+use_dynamic_batch_size: true
+max_tokens_per_gpu: 16384
+attention_dropout: 0.0
+hidden_dropout: 0.0
+accumulate_allreduce_grads_in_fp32: true
+attention_softmax_in_fp32: true
+# TE 2.6 supports packed GQA through cuDNN; its FA2 limit is 2.8.1,
+# whereas the shared verl environment has FA2 2.8.3.
+attention_backend: fused
+
+# Answer accuracy on the same local validation sets using slime.eval scorers.
+# these are the cluster's comparison sets, not the paper's full benchmark suite.
+# Evaluation runs before training and every 25 steps, including the final step 150.
+# Keep num_rollout divisible by eval_steps to evaluate the final trained weights.
+eval_steps: 25
+eval_on_resume: true  # Recover an evaluation interrupted after checkpoint saving.
+val_files:
+  - /scratch/l/luli/data/lightning_opd/eval/amc23.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/math500.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/aime26.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/hmmt26.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/mmlu_college_chemistry.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/mmlu_college_medicine.parquet
+  - /scratch/l/luli/data/lightning_opd/eval/gpqa_diamond.parquet
+val_max_prompt_length: 4096
+val_max_completion_length: 16384
+val_n: 1
+val_temperature: 0.7
+val_top_p: 0.8
+val_top_k: 20
+save_eval_generations: false
+save_model: final  # Save only at step 150 or before the allocation expires, independently of K.
+walltime_checkpoint_margin_seconds: 1200
+# Resume inside a block reuses its saved policy ID and cached teacher logprobs.
+save_total_limit: 1  # null keeps all training checkpoints.
+save_retain_interval: null  # Disable Megatron's separate interval-based pruning.
+async_save: false

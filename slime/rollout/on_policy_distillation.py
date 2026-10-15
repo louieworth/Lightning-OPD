@@ -6,6 +6,7 @@ import torch
 
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.types import Sample
+from slime.utils.opd_config import needs_teacher_features
 
 
 async def reward_func(args, sample, **kwargs):
@@ -25,6 +26,8 @@ async def reward_func(args, sample, **kwargs):
         "return_logprob": True,
         "logprob_start_len": 0,
     }
+    if needs_teacher_features(args):
+        payload["opd_response_length"] = sample.response_length
 
     if sample.multimodal_inputs and sample.multimodal_inputs.get("images"):
         image_data = sample.multimodal_inputs["images"]
@@ -60,13 +63,19 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
             sample.teacher_log_probs = torch.tensor(
                 [float(x) for x in pre_teacher_lp], dtype=torch.float32
             )
+            features = metadata.get("teacher_features")
         else:
             # Online OPD: extract teacher log-probs from sglang response
             t_log_probs = torch.tensor(
-                [item[0] for item in reward["meta_info"]["input_token_logprobs"][1:]],
+                [item[0] for item in reward["meta_info"]["input_token_logprobs"][-response_lengths[i]:]],
                 dtype=torch.float32,
             )
             sample.teacher_log_probs = t_log_probs[-response_lengths[i]:]
+            features = reward["meta_info"].get("opd_teacher_features")
+        if needs_teacher_features(args):
+            if not features:
+                raise ValueError("Teacher distribution features are missing; re-score offline data or use the feature teacher service.")
+            sample.teacher_features = features
 
     scalar_rewards = [0.0] * len(samples)
     return scalar_rewards, scalar_rewards

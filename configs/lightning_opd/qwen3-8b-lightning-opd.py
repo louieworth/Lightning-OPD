@@ -93,7 +93,7 @@ def execute(rerun=True):
     if os.environ.get("WANDB_KEY"):
         wandb_args = (
             "--use-wandb "
-            "--wandb-project lightning-opd "
+            "--wandb-project onestep-opd "
             f"--wandb-group {Path(__file__).stem} "
             f"--wandb-key {os.environ['WANDB_KEY']} "
         )

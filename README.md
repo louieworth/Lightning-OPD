@@ -1,5 +1,8 @@
 # Lightning OPD: Efficient Post-Training for Large Reasoning Models with Offline On-Policy Distillation
 
+Local YAML launchers support sampled-token, student/teacher top-k, and full-vocabulary
+reverse-KL loss. See [OPD loss options](docs/opd_loss_tokens.md).
+
 <div align="center">
   <a href="https://arxiv.org/abs/2604.13010"><img src="https://img.shields.io/static/v1?label=arXiv&message=Lightning-OPD&color=red&logo=arxiv"></a> &ensp;
   <a href="https://huggingface.co/Lightning-OPD"><img src="https://img.shields.io/static/v1?label=HuggingFace&message=Lightning-OPD&color=yellow&logo=huggingface"></a> &ensp;

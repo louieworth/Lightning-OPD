@@ -369,6 +369,7 @@ def train_one_step(
                 "returns",
                 "rollout_log_probs",
                 "teacher_log_probs",    # For OPD distillation loss
+                "teacher_features",     # Shared-file references, not dense vocabulary tensors
             ],
             args.data_pad_size_multiplier,
         )

@@ -183,6 +183,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # rollout
         def add_rollout_arguments(parser):
             parser.add_argument(
+                "--save-final-only", action="store_true",
+                help="Save only at the final training update or the walltime checkpoint deadline.",
+            )
+            parser.add_argument(
+                "--checkpoint-deadline", type=float, default=None,
+                help="Unix time to stop evaluation or finish the current update, save a synchronous checkpoint and exit.",
+            )
+            parser.add_argument(
                 "--hf-checkpoint",
                 type=str,
                 default=None,
@@ -434,6 +442,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1,
                 help="Interval for updating the weights",
+            )
+            parser.add_argument(
+                "--eval-on-resume",
+                action="store_true",
+                help="Evaluate the loaded checkpoint before continuing a resumed training run.",
+            )
+            parser.add_argument(
+                "--eval-output-dir",
+                type=str,
+                default=None,
+                help="Directory for custom evaluation metrics, including runs without training checkpoints.",
+            )
+            parser.add_argument(
+                "--lightning-block-config",
+                type=str,
+                default=None,
+                help="Saved YAML recipe for fixed-data, K-block Lightning OPD.",
             )
             parser.add_argument(
                 "--keep-old-actor",
@@ -750,6 +775,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
+            parser.add_argument(
+                "--opd-loss-token-mode", choices=["sample", "top_k_student", "top_k_teacher", "full_vocab"],
+                default="sample", help="OPD sampled-token policy loss or direct reverse KL on a selected vocabulary support.",
+            )
+            parser.add_argument("--opd-token-top-k", type=int, default=32,
+                                help="Vocabulary candidates for OPD loss; independent of policy_rollout_k.")
+            parser.add_argument("--opd-distribution-chunk-size", type=int, default=32,
+                                help="Maximum response positions per OPD vocabulary gather/checkpoint.")
+            parser.add_argument("--opd-loss-max-clip", type=float, default=None,
+                                help="Bound sampled advantages to +/- value, or distribution KL to [0,value].")
+            parser.add_argument("--opd-log-prob-min-clip", type=float, default=None,
+                                help="Optional logprob floor before sampled-token advantage calculation only.")
             parser.add_argument(
                 "--eps-clip-c",
                 type=float,
@@ -1497,6 +1534,11 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    from slime.utils.opd_config import needs_teacher_features, validate_opd_options
+
+    validate_opd_options(args)
+    if needs_teacher_features(args) and args.advantage_estimator != "on_policy_distillation":
+        raise ValueError("OPD distribution loss requires advantage_estimator: on_policy_distillation.")
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.kl_coef != 0 or args.use_kl_loss:

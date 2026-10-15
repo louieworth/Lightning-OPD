@@ -12,6 +12,7 @@
 #   NUM_NODES   - Number of nodes (default: 4)
 #   NUM_GPUS    - GPUs per node (default: 8)
 #   MASTER_ADDR - Master node address (default: localhost)
+#   WANDB_PROJECT - W&B project (default: onestep-opd)
 #
 # Prerequisites:
 #   - LlamaFactory installed (pip install llamafactory)
@@ -25,6 +26,7 @@ set -euo pipefail
 NUM_NODES="${NUM_NODES:-4}"
 NUM_GPUS="${NUM_GPUS:-8}"
 MASTER_ADDR="${MASTER_ADDR:-localhost}"
+export WANDB_PROJECT="${WANDB_PROJECT:-onestep-opd}"
 
 torchrun \
     --nnodes "${NUM_NODES}" \
