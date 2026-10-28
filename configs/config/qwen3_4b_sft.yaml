@@ -4,17 +4,13 @@ model_path: Qwen/Qwen3-4B-Base
 teacher_model_path: Qwen/Qwen3-8B
 hf_home: /scratch/l/luli/hf
 local_models_only: true
-python_executable: /scratch/l/luli/conda/envs/verl/bin/python
-# SFT-only packages are archived to conserve scratch inodes, then extracted
-# to node-local /tmp. Shared PyTorch/CUDA come from the existing verl.
-sft_dependency_archive: /scratch/l/luli/src/Lightning-OPD/.runtime/sft/packages.tar.gz
-generation_python: /scratch/l/luli/conda/envs/verl/bin/python
-cuda_home: /cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Core/cudacore/12.6.2
+python_executable: null  # Current Python; optionally set an interpreter path.
+# Install SFT packages in the selected environment. An archive overlay is optional.
+sft_dependency_archive: null
+generation_python: null  # Defaults to the selected training Python.
+cuda_home: null
 env_file: .env
 use_wandb: true
-wandb_mode: offline
-wandb_entity: li-jiang-opd
-project_name: onestep-opd
 experiment_name: qwen3_4b_sft_qwen3_8b
 output_dir: /scratch/l/luli/results/onestep/model
 

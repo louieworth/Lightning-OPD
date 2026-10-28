@@ -141,6 +141,37 @@ def _save_wandb_run_id_to_checkpoint(args):
 def _compute_config_for_logging(args):
     output = deepcopy(args.__dict__)
 
+    # Launcher metadata is absent from slime's CLI; log it as fixed W&B config.
+    config_path = getattr(args, "lightning_block_config", None)
+    if not config_path and getattr(args, "eval_config", None):
+        from pathlib import Path
+
+        config_path = Path(args.eval_config).with_name("config.yaml")
+    if config_path:
+        from pathlib import Path
+
+        import yaml
+
+        path = Path(config_path)
+        if path.is_file():
+            launcher_config = yaml.safe_load(path.read_text())
+            for key in ("model_path", "teacher_model_path", "policy_rollout_k", "val_n",
+                        "epoch", "num_rollout_per_epoch", "num_rollout"):
+                if key in launcher_config:
+                    output[key] = launcher_config[key]
+            for source, target in (("model_path", "student_model"), ("teacher_model_path", "teacher_model")):
+                if source in launcher_config:
+                    output[target] = launcher_config[source]
+
+    # Dataset overrides are effective even when the CLI fallback remains 1.
+    datasets = getattr(args, "eval_datasets", None) or []
+    if datasets:
+        counts = {dataset.name: dataset.n_samples_per_eval_prompt for dataset in datasets}
+        output["eval_samples_per_dataset"] = counts
+        if len(set(counts.values())) == 1:
+            output["n_samples_per_eval_prompt"] = next(iter(counts.values()))
+            output["val_n"] = output["n_samples_per_eval_prompt"]
+
     whitelist_env_vars = [
         "SLURM_JOB_ID",
         # We may insert more default values here, and may also allow users to configure a whitelist

@@ -170,6 +170,50 @@ def teacher_identity(cfg, identity):
     return dict(identity, teacher_features_version=1) if needs_teacher_features(cfg) else identity
 
 
+def checkpoint_identity(args, completed_steps):
+    """Identify the saved boundary policy without reading multi-GB tensor shards."""
+    if not getattr(args, "save", None) or completed_steps <= 0:
+        return None
+    root = Path(args.save)
+    marker = root / "latest_checkpointed_iteration.txt"
+    if not marker.is_file() or marker.read_text().strip() != str(completed_steps - 1):
+        return None
+    checkpoint = root / f"iter_{completed_steps - 1:07d}"
+    files = sorted(checkpoint.glob("*.distcp"))
+    metadata = [checkpoint / "common.pt", checkpoint / ".metadata"]
+    if not files or not all(path.is_file() for path in metadata):
+        return None
+    return dict(path=str(checkpoint.resolve()), completed_steps=completed_steps,
+                metadata={path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in metadata},
+                shards=[dict(name=path.name, size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
+                        for path in files])
+
+
+def boundary_policy_id(args, cfg, models, index, rollout_id, new_policy_id):
+    """Reuse a boundary cache only when it is bound to the checkpoint just loaded."""
+    checkpoint = checkpoint_identity(args, rollout_id)
+    if checkpoint is None:
+        return new_policy_id
+    rollouts, scored = block_paths(cfg, index)
+    provenance = rollouts.parent / "policy_checkpoint.json"
+    resuming = (getattr(args, "start_rollout_id", None) == rollout_id
+                and getattr(args, "load", None)
+                and Path(args.load).resolve() == Path(args.save).resolve())
+    if resuming and provenance.is_file():
+        saved = json.loads(provenance.read_text())
+        policy_id = saved.get("policy_id")
+        if saved.get("checkpoint") == checkpoint and saved.get("policy_step") == rollout_id and policy_id:
+            identity = block_identity(cfg, models, index, policy_id)
+            block = schedule(cfg)[index]
+            count = block["end_sample"] - block["start_sample"]
+            if cached(scored, teacher_identity(cfg, identity), count) or cached(rollouts, identity, count):
+                print(f"Reusing policy block {index + 1} from checkpoint after step {rollout_id}.", flush=True)
+                return policy_id
+    atomic_json(provenance, dict(version=1, checkpoint=checkpoint, policy_step=rollout_id,
+                                 policy_id=new_policy_id))
+    return new_policy_id
+
+
 def write_batches(path, batches, identity, expected_rows):
     """Commit bounded row groups; a failed request never publishes partial data."""
     import pyarrow as pa
@@ -242,10 +286,35 @@ def prepare_student_block(manager, index, policy_id):
     write_batches(rollouts, batches(), identity, count)
 
 
+def teacher_response_logprobs(output, tokens, sglang_vocab_size=None):
+    """Validate response alignment, including SGLang's last-vocabulary-ID label bug.
+
+    SGLang clips input logprob *labels* with ``id < vocab_size - 1``, even
+    though it computes the logprobs from the original input IDs. Only the last
+    valid ID may therefore be labelled 0. Never change the response or scores,
+    accept out-of-vocabulary tokens, or relax alignment for the feature teacher.
+    """
+    items = output["meta_info"]["input_token_logprobs"][1:][-len(tokens):]
+    if not tokens or len(items) != len(tokens):
+        raise ValueError("Teacher returned misaligned response-token logprobs (length mismatch).")
+    for position, (item, token) in enumerate(zip(items, tokens, strict=True)):
+        returned = int(item[1])
+        if sglang_vocab_size is not None and not 0 <= token < sglang_vocab_size:
+            raise ValueError(f"Response token {token} at position {position} is outside the teacher vocabulary.")
+        clipped_last_id = sglang_vocab_size is not None and token == sglang_vocab_size - 1 and returned == 0
+        if returned != token and not clipped_last_id:
+            raise ValueError(f"Teacher returned misaligned response-token logprobs at position {position}: "
+                             f"expected token {token}, got {returned}.")
+    values = [float(item[0]) for item in items]
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Teacher returned non-finite logprobs.")
+    return values
+
+
 def score_teacher_block(args, index, policy_id):
     """The driver owns Slurm's head-node GPUs while all Ray models are offloaded."""
     import pyarrow.parquet as pq
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
 
     cfg, models = recipe(args)
     block = schedule(cfg)[index]
@@ -264,6 +333,10 @@ def score_teacher_block(args, index, policy_id):
     teacher_tokenizer = AutoTokenizer.from_pretrained(models["teacher"], trust_remote_code=True)
     if tokenizer.get_vocab() != teacher_tokenizer.get_vocab():
         raise ValueError("Student and teacher tokenizers must share token IDs for OPD.")
+    # Tokenizer size can exclude padded but valid model IDs; use the teacher's
+    # actual output vocabulary. The feature teacher returns exact labels.
+    sglang_vocab_size = None if needs_teacher_features(cfg) else AutoConfig.from_pretrained(
+        models["teacher"], trust_remote_code=True).vocab_size
     launcher = importlib.import_module("configs.opd.qwen3-4b-opd")
     env = os.environ.copy()
     devices = env.get("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(cfg["n_gpus_per_node"])))).split(",")
@@ -279,13 +352,10 @@ def score_teacher_block(args, index, policy_id):
             sampling_params=dict(temperature=0, max_new_tokens=0, skip_special_tokens=False),
             return_logprob=True, logprob_start_len=0,
             **({"opd_response_length": len(tokens)} if needs_teacher_features(cfg) else {})))
-        items = output["meta_info"]["input_token_logprobs"][1:][-len(tokens):]
-        if len(items) != len(tokens) or [int(item[1]) for item in items] != tokens:
-            raise ValueError("Teacher returned misaligned response-token logprobs.")
-        values = [float(item[0]) for item in items]
-        if not all(math.isfinite(value) for value in values):
-            raise ValueError("Teacher returned non-finite logprobs.")
-        row["metadata"]["teacher_log_probs"] = values
+        try:
+            row["metadata"]["teacher_log_probs"] = teacher_response_logprobs(output, tokens, sglang_vocab_size)
+        except ValueError as error:
+            raise ValueError(f"{error} Block {index}, fixed sample {row['metadata']['lightning_sample_index']}.") from error
         if needs_teacher_features(cfg):
             row["metadata"]["teacher_features"] = output["meta_info"]["opd_teacher_features"]
         return row
@@ -371,13 +441,13 @@ class BlockCoordinator:
         import ray
 
         self.ray, self.args, self.manager = ray, args, rollout_manager
-        self.cfg, _ = recipe(args)
+        self.cfg, self.models = recipe(args)
         if not args.offload_train or not args.offload_rollout or args.update_weights_interval != 1:
             raise ValueError("Block Lightning requires offloaded training/inference and weight sync every step.")
         self.blocks = schedule(self.cfg)
         self.loaded = None
-        # Never reuse later blocks generated by a previous, unsaved policy path.
-        # Block 0 is safe to reuse because its policy is the fixed initialization.
+        # Unsaved policy paths need a fresh lineage. Saved block-boundary policies
+        # can reuse a complete cache tied to the exact checkpoint being restored.
         self.lineage = uuid.uuid4().hex
 
     def ensure_block(self, rollout_id):
@@ -396,6 +466,8 @@ class BlockCoordinator:
                 raise ValueError("Block Lightning resume cursor does not match its cached policy block.")
         else:
             policy_id = "initial" if index == 0 else self.lineage
+            if index > 0:
+                policy_id = boundary_policy_id(self.args, self.cfg, self.models, index, rollout_id, policy_id)
             self.ray.get(self.manager.prepare_lightning_block.remote(index, policy_id))
         self.ray.get(self.manager.offload.remote())
         try:

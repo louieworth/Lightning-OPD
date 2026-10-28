@@ -24,6 +24,27 @@ exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), 
 
 
 class OfflineWandbTests(unittest.TestCase):
+    def test_renaming_explicit_metrics_preserves_wildcard_definitions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "offline-run-original" / "run-test.wandb"
+            original.parent.mkdir()
+            writer = DataStore()
+            writer.open_for_write(str(original))
+            metric = wandb_internal_pb2.Record()
+            metric.metric.glob_name = "eval_metric/*"
+            writer.write(metric)
+            writer.close()
+            target = namespace["filtered_run_file"](
+                original, root / "filtered", eval_samples_per_dataset={"amc23": 4})
+            reader = DataStore()
+            reader.open_for_scan(str(target))
+            result = wandb_internal_pb2.Record()
+            result.ParseFromString(reader.scan_data())
+            reader.close()
+            self.assertEqual(result.metric.glob_name, "eval_metric/*")
+            self.assertFalse(result.metric.name)
+
     def test_filters_a_real_log_and_preserves_source_and_indexed_avg_axis(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -43,14 +64,16 @@ class OfflineWandbTests(unittest.TestCase):
             writer.write(stats)
             history = wandb_internal_pb2.Record()
             for key, value in {"eval/step": 49, "eval_metric/math500-avg@1": 0.0,
-                               "eval/math500/pass@1": 0.0, "perf/time": 12,
+                               "eval/math500/response_len/mean": 123.5,
+                               "eval/math500/pass@4": 0.0, "perf/time": 12,
                                "lightning/block": 3}.items():
                 item = history.history.item.add()
                 item.key, item.value_json = key, json.dumps(value)
             writer.write(history)
             writer.close()
             original_bytes = original.read_bytes()
-            target = namespace["filtered_run_file"](original, root / "filtered")
+            target = namespace["filtered_run_file"](
+                original, root / "filtered", eval_samples_per_dataset={"math500": 4})
             self.assertEqual(original.read_bytes(), original_bytes)
             reader = DataStore()
             reader.open_for_scan(str(target))
@@ -64,10 +87,16 @@ class OfflineWandbTests(unittest.TestCase):
             self.assertEqual(records[0].metric.name, "eval_step")
             self.assertTrue(records[0].metric.options.hidden)
             self.assertEqual(records[1].metric.step_metric, "eval_step")
+            self.assertEqual(records[1].metric.name, "eval_metric/math500-avg@4")
             row = {item.key: json.loads(item.value_json) for item in records[-1].history.item}
-            self.assertEqual(row, {"eval_step": 50, "eval_metric/math500-avg@1": 0.0})
+            self.assertEqual(row, {"eval_step": 50, "eval_metric/math500-avg@4": 0.0,
+                                   "eval_metric/math500-pass@4": 0.0,
+                                   "eval_metric/math500-response-length": 123.5})
             replay = namespace["filtered_run_file"](
-                original, root / "replayed", {(50, "eval_metric/math500-avg@1"): 0.0})
+                original, root / "replayed", {(50, "eval_metric/math500-avg@4"): 0.0,
+                                              (50, "eval_metric/math500-pass@4"): 0.0,
+                                              (50, "eval_metric/math500-response-length"): 123.5},
+                {"math500": 4})
             reader = DataStore()
             reader.open_for_scan(str(replay))
             histories = 0

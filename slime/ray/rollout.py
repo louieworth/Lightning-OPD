@@ -4,6 +4,7 @@
 import logging
 import multiprocessing
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -82,8 +83,16 @@ class RolloutManager:
             self._health_monitor = RolloutHealthMonitor(self, args)
 
     def dispose(self):
-        if self._metric_checker is not None:
-            self._metric_checker.dispose()
+        try:
+            if self._metric_checker is not None:
+                self._metric_checker.dispose()
+        finally:
+            # Ray stops worker children when the driver exits. Join the grading
+            # pool while its resource tracker is still alive, so its semaphore
+            # finalizers do not talk to a replacement (empty) tracker.
+            grading = sys.modules.get("slime.eval.reward_async")
+            if grading is not None:
+                grading.shutdown()
 
     # TODO maybe rename "rollout_engines" and "all_rollout_engines" later
     @property
@@ -574,13 +583,17 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             return
 
     log_dict = dict(extra_metrics or {})
+    eval_counts = {dataset.name: dataset.n_samples_per_eval_prompt
+                   for dataset in (getattr(args, "eval_datasets", None) or [])}
     for key in data.keys():
         rewards = data[key]["rewards"]
-        # Prefer the evaluator's per-question Avg@1 over the sample reward mean.
-        avg_at_one = log_dict.pop(f"eval/{key}/avg@1", None)
-        if avg_at_one is None:
-            avg_at_one = sum(rewards) / len(rewards)
-        log_dict[f"eval_metric/{key}-avg@1"] = avg_at_one
+        count = eval_counts.get(key, args.n_samples_per_eval_prompt)
+        # Use the evaluator's per-question mean and retain its sampling count.
+        average = log_dict.pop(f"eval/{key}/avg@{count}", None)
+        legacy_average = log_dict.pop(f"eval/{key}/avg@1", None)
+        if average is None:
+            average = legacy_average if legacy_average is not None else sum(rewards) / len(rewards)
+        log_dict[f"eval_metric/{key}-avg@{count}"] = average
         log_dict.pop(f"eval/{key}", None)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
@@ -591,7 +604,7 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
                     flat_rewards=rewards,
-                    group_size=args.n_samples_per_eval_prompt,
+                    group_size=count,
                 ),
                 f"eval/{key}-",
             )

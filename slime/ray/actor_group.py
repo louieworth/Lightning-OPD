@@ -136,6 +136,9 @@ class RayTrainGroup:
     def clear_memory(self):
         return ray.get([actor.clear_memory.remote() for actor in self._actor_handlers])
 
+    def dispose(self):
+        return ray.get([actor.dispose.remote() for actor in self._actor_handlers])
+
     def connect(self, critic_group):
         return ray.get(
             [

@@ -11,13 +11,23 @@ from slime.eval.baseline_reward import compute_score as score_sync
 _pool = None
 
 
+def shutdown():
+    """Join grading workers before Ray tears down their resource tracker."""
+    global _pool
+    pool, _pool = _pool, None
+    if pool is not None:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+atexit.register(shutdown)
+
+
 async def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
     # verl's synchronous reward functions run in threads, where SIGALRM-based
     # Math-Verify parsing fails. A spawned process has an independent main thread.
     global _pool
     if _pool is None:
         _pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
-        atexit.register(_pool.shutdown)
     return await asyncio.get_running_loop().run_in_executor(
         _pool, partial(score_sync, data_source, solution_str, ground_truth, extra_info)
     )

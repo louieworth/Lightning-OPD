@@ -50,7 +50,7 @@ class EvalLoggingTests(unittest.TestCase):
         data = {"math500": {"rewards": [1.0, 0.0, 0.0], "samples": [object()], "truncated": [0, 1, 0]}}
         result = self.log_eval(24, self.args, data, metrics)
         self.assertEqual(metrics, original)
-        self.assertEqual(result["eval_metric/math500-avg@1"], 0.6)
+        self.assertEqual(result["eval_metric/math500-avg@2"], 0.6)
         self.assertNotIn("eval/math500/avg@1", result)
         self.assertNotIn("eval/math500", result)
         self.assertEqual(result["eval/math500/pass@1"], 0.6)
@@ -66,7 +66,7 @@ class EvalLoggingTests(unittest.TestCase):
         data = {"amc23": {"rewards": [1.0, 0.0]}, "hmmt26": {"rewards": [1.0]}}
         result = self.log_eval(0, self.args, data, {"eval/hmmt26/avg@1": 0.0})
         averages = {key: value for key, value in result.items() if key.startswith("eval_metric/")}
-        self.assertEqual(averages, {"eval_metric/amc23-avg@1": 0.5, "eval_metric/hmmt26-avg@1": 0.0})
+        self.assertEqual(averages, {"eval_metric/amc23-avg@2": 0.5, "eval_metric/hmmt26-avg@2": 0.0})
         self.assertFalse(any(key.startswith("eval/") and key.endswith("/avg@1") for key in result))
         self.assertNotIn("eval/amc23", result)
         self.assertNotIn("eval/hmmt26", result)
@@ -78,6 +78,16 @@ class EvalLoggingTests(unittest.TestCase):
         initialize()
         wandb.define_metric.assert_any_call("eval_step", hidden=True)
         wandb.define_metric.assert_any_call("eval_metric/*", step_metric="eval_step", step_sync=False)
+
+    def test_dataset_count_controls_label_and_prefers_exact_avg_at_four(self):
+        self.args.eval_datasets = [SimpleNamespace(name="amc23", n_samples_per_eval_prompt=4)]
+        self.args.log_passrate = False
+        source = {"eval/amc23/avg@4": 0.25, "eval/amc23/avg@1": 0.5}
+        result = self.log_eval(19, self.args, {"amc23": {"rewards": [1, 0, 0, 0]}}, source)
+        self.assertEqual(result["eval_metric/amc23-avg@4"], 0.25)
+        self.assertNotIn("eval_metric/amc23-avg@1", result)
+        self.assertNotIn("eval/amc23/avg@4", result)
+        self.assertEqual(source["eval/amc23/avg@1"], 0.5)
 
     def test_initial_periodic_and_final_steps_use_completed_updates(self):
         self.args.log_passrate = False

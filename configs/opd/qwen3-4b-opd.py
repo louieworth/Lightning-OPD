@@ -28,6 +28,9 @@ import urllib.request
 import yaml
 from slime.rollout import lightning_opd_blocks as lightning_blocks
 from slime.utils.opd_config import needs_teacher_features, validate_opd_options
+from slime.utils.storage import GIB, checkpoint_reserve_bytes, model_weight_bytes, require_free_space
+from slime.utils.training_epochs import normalize_epochs
+from slime.utils.wandb_paths import wandb_directory
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = "configs.opd.qwen3-4b-opd"
@@ -40,9 +43,12 @@ LAUNCHER_KEYS = {
     "local_models_only",
     "hf_home",
     "env_file",
+    "wandb_dir",
     "output_dir",
     "experiment_name",
     "resume",
+    "epoch",
+    "num_rollout_per_epoch",
     "python_executable",
     "megatron_path",
     "cuda_home",
@@ -83,7 +89,6 @@ LAUNCHER_KEYS = {
     "save_model",
     "save_eval_multiplier",
     "save_total_limit",
-    "walltime_checkpoint_margin_seconds",
 }
 
 
@@ -92,11 +97,16 @@ def read_config(path, method, resume=False):
     cfg = yaml.safe_load(path.read_text())
     if not isinstance(cfg, dict) or cfg.get("method") != method:
         raise ValueError(f"{path}: expected method: {method}")
+    cfg = normalize_epochs(cfg)
+    # A full Megatron installation may already be provided by the active
+    # environment. An explicit source checkout is an optional override.
+    megatron = cfg.get("megatron_path") or os.environ.get("MEGATRON_PATH")
+    cfg["megatron_path"] = str(Path(megatron).expanduser().resolve()) if megatron else None
     if resume:
         cfg["resume"] = True
     if cfg.get("resume") == "auto":
         cfg["resume"] = (run_dir(cfg) / "checkpoints/latest_checkpointed_iteration.txt").is_file()
-    cfg.setdefault("save_total_limit", None)
+    cfg.setdefault("save_total_limit", 1)
     cfg.setdefault("opd_loss_token_mode", "sample")
     cfg.setdefault("opd_token_top_k", 32)
     cfg.setdefault("opd_distribution_chunk_size", 32)
@@ -129,42 +139,33 @@ def read_config(path, method, resume=False):
     if any(not isinstance(cfg[key], int) or cfg[key] < 1 for key in positive):
         raise ValueError("Node/GPU counts, batch sizes, parallel sizes, steps and timeouts must be positive integers.")
     if lightning_blocks.enabled(cfg):
-        blocks = lightning_blocks.schedule(cfg)
+        lightning_blocks.schedule(cfg)
         if cfg["n_samples_per_prompt"] != 1 or cfg["rollout_batch_size"] != cfg["global_batch_size"]:
             raise ValueError("Block Lightning requires one response per prompt and rollout_batch_size == global_batch_size.")
         if cfg["rollout_shuffle"] or not cfg["colocate"]:
             raise ValueError("Block Lightning requires rollout_shuffle: false and colocate: true.")
         if cfg.get("async_save") or cfg.get("update_weights_interval", 1) != 1 or cfg.get("use_critic"):
             raise ValueError("Block Lightning requires synchronous saves, update_weights_interval: 1 and no critic.")
-        if cfg.get("save_model") == "final" and "save_eval_multiplier" not in cfg:
-            cfg["save_interval"] = cfg["num_rollout"]
-        elif "save_model" in cfg or "save_eval_multiplier" in cfg:
-            raise ValueError("Block Lightning supports save_model: final or its legacy first-block save policy.")
-        else:
-            cfg["save_interval"] = blocks[0]["end_step"]
-    elif "save_model" in cfg or "save_eval_multiplier" in cfg:
-        cfg.setdefault("save_model", "active")
-        cfg.setdefault("save_eval_multiplier", 1)
-        multiplier = cfg["save_eval_multiplier"]
-        if type(multiplier) is not int or multiplier < 1:
-            raise ValueError("save_eval_multiplier must be an integer >= 1.")
-        mode = cfg["save_model"]
-        if mode is None:
-            cfg["save_interval"] = None
-        elif mode == "final":
-            cfg["save_interval"] = cfg["num_rollout"]
-        elif mode == "active":
-            if type(cfg.get("eval_steps")) is not int or cfg["eval_steps"] < 1:
-                raise ValueError("save_model: active requires positive eval_steps.")
-            cfg["save_interval"] = cfg["eval_steps"] * multiplier
-        else:
-            raise ValueError("save_model must be null (no saves), final, or active.")
+    cfg.setdefault("save_model", "active")
+    cfg.setdefault("save_eval_multiplier", 1)
+    multiplier = cfg["save_eval_multiplier"]
+    if type(multiplier) is not int or multiplier < 1:
+        raise ValueError("save_eval_multiplier must be an integer >= 1.")
+    mode = cfg["save_model"]
+    if mode is None:
+        cfg["save_interval"] = None
+    elif mode == "final":
+        cfg["save_interval"] = cfg["num_rollout"]
+    elif mode == "active":
+        if type(cfg.get("eval_steps")) is not int or cfg["eval_steps"] < 1:
+            raise ValueError("save_model: active requires positive eval_steps.")
+        cfg["save_interval"] = cfg["eval_steps"] * multiplier
+    else:
+        raise ValueError("save_model must be null (no saves), final, or active.")
     if method == "opd" and not cfg.get("teacher_url") and cfg["teacher_num_gpus"] < 1:
         raise ValueError("A managed OPD teacher requires teacher_num_gpus > 0.")
     if cfg["max_train_samples"] is not None and cfg["max_train_samples"] < 1:
         raise ValueError("max_train_samples must be positive or null.")
-    if cfg["wandb_mode"] not in {"offline", "online", "disabled"}:
-        raise ValueError("wandb_mode must be offline, online, or disabled.")
     actor = cfg["actor_num_nodes"] * cfg["actor_num_gpus_per_node"]
     teacher = cfg["teacher_num_gpus"] if method == "opd" and not cfg.get("teacher_url") else 0
     total = cfg["nnodes"] * cfg["n_gpus_per_node"]
@@ -209,7 +210,7 @@ def read_config(path, method, resume=False):
             raise ValueError("save_total_limit requires synchronous checkpoint saving; set async_save: false.")
         if cfg.get("save_retain_interval") is not None:
             raise ValueError("Set save_retain_interval: null when using save_total_limit for post-eval cleanup.")
-        if not lightning_blocks.enabled(cfg) and cfg.get("save_model") != "final" and cfg.get("eval_steps") and cfg.get("save_interval") is not None:
+        if cfg.get("save_model") != "final" and cfg.get("eval_steps") and cfg.get("save_interval") is not None:
             interval = cfg["save_interval"]
             if type(interval) is not int or interval < 1 or interval % cfg["eval_steps"]:
                 raise ValueError("With save_total_limit, save_interval must be a positive multiple of eval_steps.")
@@ -235,7 +236,25 @@ def load_env(path):
         if not sep or not key.strip().isidentifier():
             raise ValueError(f"Invalid dotenv assignment at {path}:{number}")
         parts = shlex.split(value, comments=True)
-        os.environ.setdefault(key.strip(), " ".join(parts))
+        key, value = key.strip(), " ".join(parts)
+        if key in {"WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT", "WANDB_MODE"}:
+            os.environ[key] = value
+        else:
+            os.environ.setdefault(key, value)
+
+
+def wandb_env():
+    """Resolve W&B settings from the loaded .env, independently of YAML."""
+    mode = os.environ.get("WANDB_MODE") or "offline"
+    if mode not in {"offline", "online", "disabled"}:
+        raise ValueError("WANDB_MODE in env_file must be offline, online, or disabled.")
+    env = {"WANDB_MODE": mode, "WANDB_PROJECT": os.environ.get("WANDB_PROJECT") or "onestep-opd"}
+    for key in ("WANDB_ENTITY", "WANDB_API_KEY"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    if not env.get("WANDB_API_KEY") and os.environ.get("WANDB_KEY"):
+        env["WANDB_API_KEY"] = os.environ["WANDB_KEY"]
+    return env
 
 
 def runtime_env(cfg):
@@ -248,12 +267,12 @@ def runtime_env(cfg):
             "RAY_USAGE_STATS_ENABLED": "0",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
             "NCCL_CUMEM_ENABLE": "0",
-            "WANDB_MODE": cfg["wandb_mode"],
-            "WANDB_ENTITY": cfg["wandb_entity"] or "",
             "WANDB_DISABLE_CODE": "true",
             "WANDB_DISABLE_GIT": "true",
+            "WANDB_DIR": str(wandb_directory(cfg, ROOT)),
         }
     )
+    env.update(wandb_env())
     env["PYTHONPATH"] = os.pathsep.join(
         str(x) for x in (ROOT, cfg.get("megatron_path"), env.get("PYTHONPATH")) if x
     )
@@ -261,6 +280,9 @@ def runtime_env(cfg):
     # Preloaded TorchMemorySaver workers start before torch loads its CUDA libs.
     # Use the CUDA runtime bundled with this interpreter's PyTorch wheel.
     cuda_runtime = Path(sysconfig.get_paths()["purelib"]) / "nvidia/cuda_runtime/lib"
+    if not cuda_runtime.is_dir():
+        cuda_runtime = next((Path(path) / "nvidia/cuda_runtime/lib" for path in sys.path
+                             if (Path(path) / "nvidia/cuda_runtime/lib").is_dir()), cuda_runtime)
     if cuda_runtime.is_dir():
         env["LD_LIBRARY_PATH"] = str(cuda_runtime) + (
             os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else ""
@@ -270,8 +292,6 @@ def runtime_env(cfg):
         env["PATH"] = str(Path(env["CUDA_HOME"]) / "bin") + os.pathsep + env["PATH"]
     if cfg["local_models_only"]:
         env.update(HF_HUB_OFFLINE="1", HF_DATASETS_OFFLINE="1")
-    if env.get("WANDB_KEY") and not env.get("WANDB_API_KEY"):
-        env["WANDB_API_KEY"] = env["WANDB_KEY"]
     env.pop("WANDB_KEY", None)
     return env
 
@@ -392,8 +412,8 @@ def convert_data(source, target, limit=None):
     return str(target)
 
 
-def prepare_prompts(cfg):
-    """CPU-only preparation of DAPO-Math-17k and all requested eval parquet."""
+def convert_datasets(cfg):
+    """Prepare train/eval parquet, reusing prepared inputs when their source is absent."""
     import pyarrow.parquet as pq
 
     records = []
@@ -403,17 +423,28 @@ def prepare_prompts(cfg):
             source = Path(cfg["source_data_dir"]) / split / target.name
             if source.resolve() == target.resolve():
                 raise ValueError("source_data_dir must differ from the prepared train/eval destinations.")
-            convert_data(source, target)
-            rows = pq.ParquetFile(target).metadata.num_rows
+            reuse = not source.is_file()
+            if not reuse:
+                convert_data(source, target)
+            elif not target.is_file():
+                raise FileNotFoundError(f"Prepared dataset missing: {target}; original source also missing: {source}")
+            parquet = pq.ParquetFile(target)
+            rows = parquet.metadata.num_rows
+            if rows < 1 or not {"prompt", "label", "metadata"}.issubset(parquet.schema_arrow.names):
+                raise ValueError(
+                    f"{target}: expected nonempty prepared prompt/label/metadata columns; "
+                    f"provide a prepared dataset or restore the original source: {source}"
+                )
             record = {
                 "dataset": target.stem,
                 "split": split,
                 "rows": rows,
-                "source": str(source.resolve()),
+                "source": None if reuse else str(source.resolve()),
                 "path": str(target.resolve()),
             }
             records.append(record)
-            print(f"Prepared {target.stem}: {rows:,} rows -> {target}", flush=True)
+            action = "Reused" if reuse else "Prepared"
+            print(f"{action} {target.stem}: {rows:,} rows -> {target}", flush=True)
     index = Path(cfg["train_files"]).parent.parent / "prepared_inputs.json"
     index.write_text(json.dumps(records, indent=2) + "\n")
     return records
@@ -452,7 +483,7 @@ async def baseline_eval_reward(args, sample, **kwargs):
     metadata = sample.metadata or {}
     source = metadata.get("data_source")
     if not source:
-        raise ValueError("Evaluation metadata must contain data_source; run --prepare-prompts.")
+        raise ValueError("Evaluation metadata must contain data_source; run --convert-datasets explicitly.")
     # Keep score/acc/formatted consistent with slime.eval.baseline_reward, including MC handling.
     return await baseline_module("reward_async").compute_score(
         source, sample.response, sample.label, metadata.get("extra_info") or {}
@@ -540,6 +571,10 @@ def evaluate(args, rollout_id, data_source, evaluation=True):
                 k=datasets[name].n_samples_per_eval_prompt,
             )
         )
+        # Persist completion lengths before worker shutdown, alongside accuracy.
+        metrics[f"eval_metric/{name}-response-length"] = (
+            sum(sample.effective_response_length for sample in samples) / len(samples)
+        )
     output.metrics = metrics
     # Evaluation still writes metrics when training checkpoint saving is disabled.
     target = (
@@ -557,12 +592,9 @@ def evaluate(args, rollout_id, data_source, evaluation=True):
     config = target.parent / "config.yaml"
     if config.is_file():
         cfg = yaml.safe_load(config.read_text())
-        interval = cfg.get("save_interval")
-        saved = (
-            rollout_id + 1 == interval
-            if lightning_blocks.enabled(cfg)
-            else interval is not None and (rollout_id + 1) % interval == 0
-        )
+        tracker = Path(args.save) / "latest_checkpointed_iteration.txt" if args.save else None
+        saved = (cfg.get("save_interval") is not None and tracker is not None
+                 and tracker.is_file() and int(tracker.read_text().strip()) == rollout_id)
         if saved:
             prune_training_checkpoints(
                 args.save, cfg.get("save_total_limit"), rollout_id,
@@ -604,8 +636,6 @@ def training_args(cfg, student, teacher_url, eval_path=None):
         args["rm_url"] = teacher_url.rstrip("/") + ("" if teacher_url.endswith("/generate") else "/generate")
     if cfg.get("save_model") == "final":
         args["save_final_only"] = True
-    if os.environ.get("OPD_CHECKPOINT_DEADLINE") and cfg.get("save_interval") is not None:
-        args["checkpoint_deadline"] = float(os.environ["OPD_CHECKPOINT_DEADLINE"])
     if lightning_blocks.enabled(cfg):
         args["lightning_block_config"] = str(run_dir(cfg) / "config.yaml")
         args["rollout_function_path"] = "slime.rollout.lightning_opd_blocks.generate_cached_rollout"
@@ -615,6 +645,7 @@ def training_args(cfg, student, teacher_url, eval_path=None):
             eval_interval=cfg["eval_steps"],
             eval_output_dir=str(run_dir(cfg) / "eval_metrics"),
             eval_max_prompt_len=cfg["val_max_prompt_length"],
+            n_samples_per_eval_prompt=cfg["val_n"],
             eval_function_path=MODULE + ".evaluate",
         )
         if cfg["save_eval_generations"]:
@@ -624,17 +655,18 @@ def training_args(cfg, student, teacher_url, eval_path=None):
             completed = int(tracker.read_text().strip())
             if (
                 (run_dir(cfg) / "eval_metrics" / f"{completed}.json").is_file()
-                or (completed + 1) % cfg["eval_steps"]
+                or ((completed + 1) % cfg["eval_steps"] and completed + 1 != cfg["num_rollout"])
             ):
                 args["eval_on_resume"] = False  # Keep the existing completed evaluation.
     if cfg["use_wandb"]:
+        wandb = wandb_env()
         args.update(
             use_wandb=True,
-            wandb_project=cfg["project_name"],
+            wandb_project=wandb["WANDB_PROJECT"],
             wandb_group=cfg["experiment_name"],
-            wandb_team=cfg["wandb_entity"],
-            wandb_mode=cfg["wandb_mode"],
-            wandb_dir=str(run_dir(cfg) / "wandb"),
+            wandb_team=wandb.get("WANDB_ENTITY"),
+            wandb_mode=wandb["WANDB_MODE"],
+            wandb_dir=str(wandb_directory(cfg, ROOT)),
             disable_wandb_random_suffix=True,
         )
     result = []
@@ -665,9 +697,13 @@ def check_inputs(cfg, preparation=False):
 
     for source in sources:
         if Path(source).suffix == ".parquet":
-            fields = pq.read_schema(source).names
-            if not {"prompt", "label", "metadata"}.issubset(fields):
-                raise ValueError(f"{source}: expected prepared prompt/label/metadata columns; run --prepare-prompts.")
+            parquet = pq.ParquetFile(source)
+            if not {"prompt", "label", "metadata"}.issubset(parquet.schema_arrow.names):
+                raise ValueError(
+                    f"{source}: expected prepared prompt/label/metadata columns; run --convert-datasets explicitly."
+                )
+            if parquet.metadata.num_rows < 1:
+                raise ValueError(f"{source}: configured dataset is empty.")
     if lightning_blocks.enabled(cfg) and not preparation:
         if pq.ParquetFile(lightning_data(cfg)).metadata.num_rows != cfg["num_rollout"] * cfg["rollout_batch_size"]:
             raise ValueError("Fixed Lightning prompt count differs from num_rollout * rollout_batch_size.")
@@ -709,7 +745,10 @@ def check_dependencies(cfg, preparation=False):
             missing.append(name)
     if missing:
         raise RuntimeError(
-            f"{sys.executable}: missing dependencies: {', '.join(missing)}. Use the README training environment; set python_executable / megatron_path in YAML."
+            f"{sys.executable}: missing dependencies: {', '.join(missing)}. "
+            "Install the training dependencies in the selected environment or use the upstream Docker image. "
+            "Megatron must include megatron.training; an external source checkout can be set with MEGATRON_PATH "
+            "or megatron_path in YAML. See configs/environment/README.md."
         )
 
 
@@ -943,7 +982,20 @@ def prepare_lightning_data(cfg, student, teacher, env):
 
 
 def cluster_nodes(cfg):
-    if os.environ.get("SLURM_JOB_NODELIST"):
+    # Resolve Slurm hosts on the host side; containers need no Slurm binaries.
+    if os.environ.get("LIGHTNING_OPD_NODE_IPS"):
+        import ipaddress
+
+        hosts = os.environ["LIGHTNING_OPD_NODE_IPS"].split(",")
+        try:
+            if any(ipaddress.ip_address(host).is_loopback for host in hosts):
+                raise ValueError("Loopback addresses cannot connect training nodes.")
+            node_index = int(os.environ["LIGHTNING_OPD_NODE_RANK"])
+        except (KeyError, ValueError) as error:
+            raise ValueError("Invalid container node IPs/rank.") from error
+        if len(hosts) != cfg["nnodes"] or len(set(hosts)) != len(hosts) or not 0 <= node_index < len(hosts):
+            raise ValueError("Container node IPs/rank do not match YAML nnodes.")
+    elif os.environ.get("SLURM_JOB_NODELIST"):
         hosts = subprocess.check_output(
             ["scontrol", "show", "hostnames", os.environ["SLURM_JOB_NODELIST"]], text=True
         ).split()
@@ -1008,19 +1060,33 @@ def check_run_state(cfg, student, teacher):
             raise ValueError("OPD resume requires a valid training checkpoint and its saved rollout cursor.")
 
 
+def check_training_storage(cfg, student):
+    directory = run_dir(cfg)
+    required = 5 * GIB
+    if cfg.get("save_interval") is not None:
+        required += checkpoint_reserve_bytes(directory / "checkpoints", student)
+    if not (checkpoint_path(cfg, student) / "latest_checkpointed_iteration.txt").is_file():
+        required += model_weight_bytes(student)
+    free = require_free_space(directory, required)
+    print(f"Storage preflight: {free / GIB:.1f} GiB free; reserve at least {required / GIB:.1f} GiB.", flush=True)
+
+
+def record_cluster_failure(done):
+    try:
+        done.write_text("failed")
+    except OSError as error:
+        # EDQUOT must not replace the original training/checkpoint exception.
+        with contextlib.suppress(OSError):
+            print(f"Could not write cluster failure marker {done}: {error}", file=sys.stderr, flush=True)
+
+
 def preflight(cfg, student, teacher):
     hosts, node_index = cluster_nodes(cfg)
     devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if devices is not None and len(devices.split(",")) != cfg["n_gpus_per_node"]:
         raise ValueError("CUDA_VISIBLE_DEVICES must expose n_gpus_per_node GPUs to each srun task.")
     check_run_state(cfg, student, teacher)
-    if cfg.get("eval_steps") and cfg["num_rollout"] % cfg["eval_steps"]:
-        raise ValueError("For end-to-end final evaluation, num_rollout must be divisible by eval_steps.")
-    if not lightning_blocks.enabled(cfg) and cfg.get("eval_steps") and cfg.get("save_interval") and cfg["num_rollout"] % cfg["save_interval"]:
-        raise ValueError(
-            "For an end-to-end final checkpoint, num_rollout must be divisible by the derived save_interval. "
-            "Choose another save_eval_multiplier or set save_model: final."
-        )
+    check_training_storage(cfg, student)
     if cfg["method"] == "lightning_opd" and not lightning_blocks.enabled(cfg):
         for path in (lightning_data(cfg), run_dir(cfg) / "data/student_rollouts.parquet"):
             manifest = path.with_suffix(".manifest.json")
@@ -1034,9 +1100,10 @@ def preflight(cfg, student, teacher):
 
 def train_cluster(cfg, student, teacher, env):
     hosts, node_index = cluster_nodes(cfg)
+    check_training_storage(cfg, student)
     directory = run_dir(cfg)
     directory.mkdir(parents=True, exist_ok=True)
-    job = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
+    job = os.environ.get("LIGHTNING_OPD_JOB_ID") or os.environ.get("SLURM_JOB_ID", str(os.getpid()))
     done = directory / f"cluster-{job}.done"
     head_ip = socket.gethostbyname(hosts[0])
     local_ip = socket.gethostbyname(hosts[node_index])
@@ -1047,7 +1114,7 @@ def train_cluster(cfg, student, teacher, env):
         no_proxy=f"127.0.0.1,localhost,{','.join(socket.gethostbyname(h) for h in hosts)}",
     )
     env["NO_PROXY"] = env["no_proxy"]
-    env["WANDB_DIR"] = str(directory / "wandb")
+    env["WANDB_DIR"] = str(wandb_directory(cfg, ROOT))
     managed_teacher = cfg["method"] == "opd" and not cfg.get("teacher_url")
     reserved = cfg["teacher_num_gpus"] if managed_teacher and node_index == len(hosts) - 1 else 0
     devices = os.environ.get("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(cfg["n_gpus_per_node"])))).split(",")
@@ -1184,24 +1251,12 @@ def train_cluster(cfg, student, teacher, env):
             ]
             print("Training command:", shlex.join(command), flush=True)
             subprocess.run(command, check=True, cwd=ROOT, env=env)
-            status_path = directory / "training_status.json"
-            status = json.loads(status_path.read_text()) if cfg.get("save_interval") is not None and status_path.is_file() else {}
-            paused = status.get("status") == "paused"
-            if lightning_blocks.enabled(cfg) and (not paused or status["global_step"] > 0):
+            if cfg.get("save_interval") is not None:
                 tracker = directory / "checkpoints/latest_checkpointed_iteration.txt"
-                expected = (
-                    status["global_step"] - 1 if paused
-                    else cfg["num_rollout"] - 1 if cfg.get("save_model") == "final"
-                    else lightning_blocks.schedule(cfg)[0]["end_step"] - 1
-                )
+                expected = cfg["num_rollout"] - 1
                 if not tracker.is_file() or int(tracker.read_text().strip()) != expected:
                     raise RuntimeError("Training exited without its required completed checkpoint.")
-            if paused:
-                continuation = ("resubmit to resume the saved checkpoint." if status["global_step"]
-                                else "no updates completed; resubmit to start from initialization.")
-                print(f"Training paused for wall time: {status['global_step']}/{cfg['num_rollout']} steps; "
-                      + continuation, flush=True)
-            if not paused and cfg.get("eval_steps") and cfg["num_rollout"] % cfg["eval_steps"] == 0:
+            if cfg.get("eval_steps"):
                 final_metrics = directory / "eval_metrics" / f"{cfg['num_rollout'] - 1}.json"
                 if not final_metrics.is_file():
                     raise FileNotFoundError(f"Training exited without final evaluation metrics: {final_metrics}")
@@ -1215,13 +1270,15 @@ def train_cluster(cfg, student, teacher, env):
             done.write_text("success")
     except BaseException:
         if node_index == 0:
-            done.write_text("failed")
+            record_cluster_failure(done)
         raise
 
 
 def main(method="opd"):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=ROOT / "configs/config" / f"qwen3_4b_{method}.yaml")
+    default_config = ("qwen3_4b_base_nt_teacher_8b.yaml" if method == "lightning_opd"
+                      else "qwen3_4b_base_opd_nt_teacher_8b.yaml")
+    parser.add_argument("--config", type=Path, default=ROOT / "configs/config" / default_config)
     parser.add_argument("--env-file", type=Path, help="Override env_file from YAML")
     parser.add_argument("--resume", action="store_true", help="Resume this experiment's Megatron checkpoint")
     modes = parser.add_mutually_exclusive_group()
@@ -1242,18 +1299,19 @@ def main(method="opd"):
         help="Collect student rollouts and precompute teacher logprobs on one node",
     )
     modes.add_argument(
-        "--prepare-prompts",
+        "--convert-datasets", "--prepare-prompts",
+        dest="convert_datasets",
         action="store_true",
-        help="CPU-only: prepare DAPO-Math-17k and all eval datasets as parquet",
+        help="CPU-only: explicitly convert source train/eval parquet to the prepared input schema",
     )
     cli = parser.parse_args()
     cfg = read_config(cli.config, method, resume=cli.resume)
-    if cli.prepare_prompts:
-        prepare_prompts(cfg)
+    if cli.convert_datasets:
+        convert_datasets(cfg)
         return
     if cli.prepare_data and method != "lightning_opd":
         parser.error("--prepare-data is only available for Lightning OPD.")
-    load_env(cli.env_file or cfg.get("env_file"))
+    load_env(cli.env_file or cfg.get("env_file") or ROOT / ".env")
     env = runtime_env(cfg)
     sys.path[:0] = [str(ROOT)] + ([cfg["megatron_path"]] if cfg.get("megatron_path") else [])
     student, teacher = selected_models(cfg, download=not (cli.dry_run or cli.check or cli.preflight))
@@ -1265,6 +1323,10 @@ def main(method="opd"):
                     "student": student,
                     "teacher": teacher,
                     "results": str(run_dir(cfg)),
+                    "epoch": cfg["epoch"],
+                    "updates_per_epoch": cfg["num_rollout_per_epoch"],
+                    "total_updates": cfg["num_rollout"],
+                    "training_prompts": cfg["num_rollout"] * cfg["rollout_batch_size"],
                     "lightning_opd_data": str(lightning_data(cfg)) if method == "lightning_opd" else None,
                     "policy_blocks": lightning_blocks.schedule(cfg) if lightning_blocks.enabled(cfg) else None,
                     "nodes": cfg["nnodes"],

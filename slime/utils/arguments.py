@@ -184,11 +184,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_rollout_arguments(parser):
             parser.add_argument(
                 "--save-final-only", action="store_true",
-                help="Save only at the final training update or the walltime checkpoint deadline.",
-            )
-            parser.add_argument(
-                "--checkpoint-deadline", type=float, default=None,
-                help="Unix time to stop evaluation or finish the current update, save a synchronous checkpoint and exit.",
+                help="Save only at the final training update.",
             )
             parser.add_argument(
                 "--hf-checkpoint",
@@ -447,6 +443,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--eval-on-resume",
                 action="store_true",
                 help="Evaluate the loaded checkpoint before continuing a resumed training run.",
+            )
+            parser.add_argument(
+                "--val-before-train",
+                action="store_true",
+                help="Run evaluation at step 0 before any training updates.",
             )
             parser.add_argument(
                 "--eval-output-dir",

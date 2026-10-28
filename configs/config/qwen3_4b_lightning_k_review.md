@@ -77,21 +77,21 @@ sbatch configs/sbatch/qwen3_4b_lightning_opd.sbatch
 | 125 | 32,000 | `eval_metrics/124.json` |
 | 150 | 38,400 | `eval_metrics/149.json` |
 
-例如 K=4，第一个 block 在第 38 步结束并保存，不在第 38 步额外 eval；下一次 eval 仍是第 50 步。评分代码、eval Parquet、sampling 参数和指标计算保持 YAML 原有设置。当前 Lightning YAML 的 eval 列表包含 8 个数据集，保留已有选择。
+例如 K=4，第一个 block 在第 38 步结束，不额外保存或 eval；下一次保存和 eval 仍是第 50 步。评分代码、eval Parquet、sampling 参数和指标计算保持 YAML 原有设置。
 
 ## 唯一 checkpoint 和 resume
 
-按本次要求，**整个训练只在第一个 block 结束时保存一次**，不是每个 block 保存一次。Lightning 的此模式不使用 `save_model`／`save_eval_multiplier`；这两个参数仍用于标准 OPD。
+Lightning 和标准 OPD 共用 `save_model: active`、`save_eval_multiplier: 1`，在每个全局评估步前同步保存。`save_total_limit: 1` 在新 checkpoint 保存且评估成功后删除旧 checkpoint，只保留最新一个，与 K 无关。
 
-保存完整 Megatron model、optimizer、scheduler、RNG 和数据读取状态。K=1 保存 `checkpoints/iter_0000149/`；K=2 保存 `checkpoints/iter_0000074/`。K>1 时最终 student 在内存中完成训练和第 150 步 eval，磁盘上保留的是第一个 block 结束后的 student。
+保存完整 Megatron model、optimizer、scheduler、RNG 和数据读取状态。例如每 20 步评估时，第 40 步保存且评估成功后删除第 20 步 checkpoint；全部评估 JSON 继续保留。最终训练更新同样保存并评估。
 
 ```bash
-sbatch configs/sbatch/qwen3_4b_lightning_opd.sbatch --resume
+sbatch configs/sbatch/qwen3_4b_base_nt_teacher_8b.sbatch --resume
 ```
 
-resume 总是从唯一 checkpoint 的下一步继续。K=2 从第 76 次更新开始，后 75 次更新中未保存的部分需要重跑。恢复时不改变绝对 eval 位置；checkpoint 恰好位于原定 eval 步且缺少 JSON 时才补评测。K=1 已保存最终 checkpoint 但最终 eval 中断时，resume 只补最终 eval。
+resume 从最新完整 checkpoint 的下一步继续。恢复时不改变绝对 eval 位置；checkpoint 位于原定 eval 步且缺少 JSON 时补评测。已保存最终 checkpoint 但最终 eval 中断时，resume 只补最终 eval。不再提前 20 分钟退出或取消评估。
 
-初始 block 的 cache 可验证后复用。后续 block 的 cache 带有当前训练实例的 policy 标识；resume 时重新生成后续 block，防止使用上一次未保存训练轨迹产生的响应。K、训练预算、采样、源数据和主要优化参数变化会拒绝原实验的 resume。
+各 block 的 cache 带有对应 policy 标识；在 block 中间 resume 时，复用该块保存的 policy 和缓存 teacher logprobs，新的 block 再由当前 policy 生成。K、训练预算、采样、源数据和主要优化参数变化会拒绝原实验的 resume。
 
 ## 文件与核心代码
 

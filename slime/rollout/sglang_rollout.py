@@ -26,7 +26,6 @@ from slime.utils.mask_utils import get_response_lengths, MultiTurnLossMaskGenera
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import encode_image_for_rollout_engine, load_processor, load_tokenizer
 from slime.utils.types import Sample
-from slime.utils.walltime import CheckpointDeadlineReached, evaluation_before_deadline
 
 from .rm_hub import async_rm, batched_async_rm
 
@@ -534,18 +533,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     coros = []
     for dataset_cfg in getattr(args, "eval_datasets", []) or []:
         coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
-    try:
-        results_list = await evaluation_before_deadline(
-            asyncio.gather(*coros), getattr(args, "checkpoint_deadline", None)
-        )
-    except CheckpointDeadlineReached:
-        # Cancel the server requests as well as their local HTTP tasks before
-        # the driver offloads inference and restores the training workers.
-        try:
-            await asyncio.wait_for(abort(args, rollout_id), timeout=30)
-        except Exception:
-            logger.warning("Could not abort all evaluation requests before checkpointing.", exc_info=True)
-        raise
+    results_list = await asyncio.gather(*coros)
     results = {}
     for r in results_list:
         results.update(r)

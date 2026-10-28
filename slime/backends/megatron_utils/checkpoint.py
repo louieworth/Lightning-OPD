@@ -8,14 +8,21 @@ from pathlib import Path
 
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import save_checkpoint as _save_checkpoint_megatron
 from megatron.training.global_vars import get_args
 
 from slime.utils import megatron_bridge_utils
 
+from .checkpoint_metadata import install_metadata_compatibility
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["save_checkpoint"]
+
+
+def save_checkpoint(*args, **kwargs):
+    install_metadata_compatibility()
+    return _save_checkpoint_megatron(*args, **kwargs)
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
@@ -28,6 +35,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
     if _is_megatron_checkpoint(load_path):
+        install_metadata_compatibility()
         return _load_checkpoint_megatron(
             ddp_model=ddp_model,
             optimizer=optimizer,

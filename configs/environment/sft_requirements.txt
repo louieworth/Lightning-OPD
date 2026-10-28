@@ -1,5 +1,5 @@
-# SFT dependency overlay for the existing verl Python 3.12 / PyTorch 2.9.
-# LlamaFactory 0.9.5 accepts the installed transformers 4.57.6.
+# SFT dependencies validated with Python 3.12 / PyTorch 2.9 / Transformers 4.57.6.
+# Install in a dedicated SFT environment; the archive overlay is optional.
 llamafactory==0.9.5
 deepspeed==0.19.7
 datasets==4.0.0

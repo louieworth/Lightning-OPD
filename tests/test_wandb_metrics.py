@@ -23,7 +23,8 @@ class WandbMetricTests(unittest.TestCase):
                   "system/cpu": 20}
         retained = filter_metrics(source)
         self.assertEqual(retained, {"train/loss": 0.5, "train/step": 24, "rollout/rewards": 0.2,
-                                    "eval_metric/math500-avg@1": 0.0, "eval_step": 25})
+                                    "eval_metric/math500-avg@1": 0.0,
+                                    "eval_metric/math500-pass@1": 0.0, "eval_step": 25})
         self.assertIn("eval/step", source)
 
     def test_logging_filters_wandb_and_preserves_tensorboard_diagnostics(self):
@@ -34,7 +35,8 @@ class WandbMetricTests(unittest.TestCase):
         args = SimpleNamespace(use_wandb=True, use_tensorboard=True)
         function(args, {"eval/step": 49, "eval_metric/amc23-avg@1": 0.0,
                         "eval/amc23/pass@1": 0.0}, "eval/step")
-        wandb.log.assert_called_once_with({"eval_step": 50, "eval_metric/amc23-avg@1": 0.0})
+        wandb.log.assert_called_once_with({"eval_step": 50, "eval_metric/amc23-avg@1": 0.0,
+                                          "eval_metric/amc23-pass@1": 0.0})
         adapter.log.assert_called_once_with(
             data={"eval_metric/amc23-avg@1": 0.0, "eval/amc23/pass@1": 0.0}, step=49)
 
@@ -50,6 +52,51 @@ class WandbMetricTests(unittest.TestCase):
         self.assertEqual(filter_metrics({"eval/step": 25, "eval_step": 25,
                                          "eval_metric/math500-avg@1": 0.0}),
                          {"eval_step": 25, "eval_metric/math500-avg@1": 0.0})
+
+    def test_keeps_each_dataset_mean_completion_length(self):
+        source = {"eval_step": 20, "eval/amc23/response_len/mean": 123.5,
+                  "eval/aime25/response_len/mean": 0.0,
+                  "eval/amc23/response_len/median": 99.0,
+                  "eval/amc23/pass@4": 0.5}
+        self.assertEqual(filter_metrics(source), {
+            "eval_step": 20, "eval_metric/amc23-response-length": 123.5,
+            "eval_metric/aime25-response-length": 0.0, "eval_metric/amc23-pass@4": 0.5})
+        self.assertIn("eval/amc23/response_len/mean", source)
+
+    def test_length_and_accuracy_share_the_completed_eval_axis(self):
+        records = [{"eval/step": 19, "eval/amc23/response_len/mean": 123.5,
+                    "eval_metric/amc23-avg@1": 0.25},
+                   {"eval_step": 20, "eval_metric/response-length/amc23": 123.5}]
+        rows = metrics_module.canonical_wandb_history(records)
+        self.assertEqual(rows, [{"_step": 20, "eval_step": 20,
+                                "eval_metric/amc23-avg@1": 0.25,
+                                "eval_metric/amc23-response-length": 123.5}])
+
+    def test_legacy_score_labels_follow_known_dataset_sample_counts(self):
+        source = {"eval_step": 20, "eval_metric/amc23-avg@1": 0.0,
+                  "eval_metric/aime25-avg@1": 0.5,
+                  "eval_metric/response-length/amc23": 123.5}
+        self.assertEqual(filter_metrics(source, {"amc23": 4, "aime25": 2}), {
+            "eval_step": 20, "eval_metric/amc23-avg@4": 0.0,
+            "eval_metric/aime25-avg@2": 0.5,
+            "eval_metric/amc23-response-length": 123.5})
+        self.assertIn("eval_metric/amc23-avg@1", source)
+
+    def test_standard_opd_eval_keeps_completed_step_and_all_three_metrics(self):
+        source = {"eval/step": 113, "eval_step": 113,
+                  "eval/amc23/avg@4": 0.25, "eval/amc23/pass@4": 0.525,
+                  "eval/amc23/response-length": 995.5375}
+        self.assertEqual(filter_metrics(source, {"amc23": 4}), {
+            "eval_step": 113, "eval_metric/amc23-avg@4": 0.25,
+            "eval_metric/amc23-pass@4": 0.525,
+            "eval_metric/amc23-response-length": 995.5375})
+
+    def test_pass_at_one_is_not_relabelled_as_pass_at_four(self):
+        result = filter_metrics({"eval_step": 20, "eval/amc23/pass@1": 0.25,
+                                 "eval_metric/amc23-avg@1": 0.25}, {"amc23": 4})
+        self.assertEqual(result["eval_metric/amc23-pass@1"], 0.25)
+        self.assertNotIn("eval_metric/amc23-pass@4", result)
+        self.assertEqual(result["eval_metric/amc23-avg@4"], 0.25)
 
     def test_canonical_history_has_one_eval_point_at_each_completed_step(self):
         records = [{"train/step": 24, "train/loss": 0.5},

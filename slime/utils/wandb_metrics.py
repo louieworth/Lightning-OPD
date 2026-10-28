@@ -9,9 +9,29 @@ def completed_eval_step(rollout_index):
     return 0 if rollout_index == 0 else rollout_index + 1
 
 
-def filter_wandb_metrics(metrics):
+def filter_wandb_metrics(metrics, eval_samples_per_dataset=None):
     result = {key: value for key, value in metrics.items()
               if not key.startswith(EXCLUDED_WANDB_PREFIXES)}
+    for key, value in metrics.items():
+        if key.startswith("eval/"):
+            dataset, separator, statistic = key[len("eval/"):].rpartition("/")
+            if separator and statistic.startswith(("avg@", "pass@")) and statistic.split("@", 1)[1].isdigit():
+                result.setdefault(f"eval_metric/{dataset}-{statistic}", value)
+        if key.startswith("eval/") and key.endswith("/response_len/mean"):
+            dataset = key[len("eval/"):-len("/response_len/mean")]
+            result.setdefault(f"eval_metric/{dataset}-response-length", value)
+        elif key.startswith("eval/") and key.endswith("/response-length"):
+            dataset = key[len("eval/"):-len("/response-length")]
+            result.setdefault(f"eval_metric/{dataset}-response-length", value)
+    for key in list(result):
+        if key.startswith("eval_metric/response-length/"):
+            dataset = key[len("eval_metric/response-length/"):]
+            result.setdefault(f"eval_metric/{dataset}-response-length", result.pop(key))
+        elif key.startswith("eval_metric/") and key.endswith("-avg@1"):
+            dataset = key[len("eval_metric/"):-len("-avg@1")]
+            count = (eval_samples_per_dataset or {}).get(dataset, 1)
+            if count != 1:
+                result.setdefault(f"eval_metric/{dataset}-avg@{count}", result.pop(key))
     if "eval/step" in metrics and EVAL_STEP_METRIC not in result:
         result[EVAL_STEP_METRIC] = completed_eval_step(metrics["eval/step"])
     return result

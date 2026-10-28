@@ -90,21 +90,82 @@ pip install llamafactory torch transformers
 
 ### Environment 3: Docker container (Step 4, 5 — logprob precomputation & Lightning OPD training)
 
-Launch the Docker container on a GPU machine:
+The local two-node H100 workflow installs dependencies and this repository at
+image build time. Its default is Qwen3-1.7B-Base with Qwen3-4B-Instruct-2507 teacher:
 
 ```bash
-bash run_docker.sh
+bash run_docker.sh build
+bash run_docker.sh submit --validate-only
+bash run_docker.sh submit
 ```
 
-Inside the container (sglang, Megatron, torch are pre-installed):
+To submit the Qwen3-0.6B-Base / Qwen3-4B-Instruct-2507 K=1 configuration
+with a 10-hour Slurm time limit, run from the repository root:
 
 ```bash
-pip install -e .
+bash run_docker.sh submit \
+  --config configs/config/qwen3_0_6b_base_nt_teacher_4b_instruct_2507_k1.yaml \
+  --time 10:00:00
 ```
+
+Change `--config` to select another training YAML. Model selection, K, learning
+rate, batch size and training steps come from that YAML; `--time` only sets the
+job's wall-time limit. This entry uses the common two-node, four-H100-per-node
+resource settings in `configs/sbatch/qwen3_h100_container.sbatch`, without reading
+the experiment-specific sbatch file. The command does not modify either file.
+
+OPD/Lightning OPD YAMLs support `epoch` (default `1`). `num_rollout` specifies
+updates per epoch; the launcher runs `num_rollout * epoch` total updates.
+For example:
+
+```yaml
+epoch: 2
+num_rollout: 120
+policy_rollout_k: 80
+experiment_name: qwen3_1_7b_base_epoch2_k80
+```
+
+With batch 128, Lightning OPD prepares 30,720 fixed prompts and performs 240
+updates, split into 80 policy blocks of 3 updates each. K is the total number of
+blocks across all epochs and must be set explicitly. Online OPD uses the same
+total update budget and continues sampling through its dataset. Use a new
+experiment name when changing epoch or K; existing runs retain their original
+resume recipe. The saved run configuration records `num_rollout_per_epoch` and
+the effective total `num_rollout`, so loading it does not multiply the budget again.
+
+Qwen3-1.7B-Base has separate epoch 2 presets that retain the original K and all
+other training settings. Their experiment names end in `_epoch2`, so their
+checkpoints and W&B runs are separate from the epoch 1 experiments:
+
+| YAML | Epoch | Total K | Total updates | Updates per block |
+|---|---|---|---|---|
+| [K=1, epoch 2](configs/config/qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k1_epoch2.yaml) | 2 | 1 | 240 | 240 |
+| [K=2, epoch 2](configs/config/qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k2_epoch2.yaml) | 2 | 2 | 240 | 120 |
+| [K=40, epoch 2](configs/config/qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k40_epoch2.yaml) | 2 | 40 | 240 | 6 |
+| [Online OPD, epoch 2](configs/config/qwen3_1_7b_base_opd_nt_teacher_4b_instruct_2507_epoch2.yaml) | 2 | N/A | 240 | N/A |
+
+W&B records `epoch: 2`, `num_rollout_per_epoch: 120` and `num_rollout: 240` as
+fixed run configuration; Lightning OPD also records `policy_rollout_k`.
+The online OPD preset uses a live teacher and a separate `_epoch2` W&B directory.
+To submit one of these presets:
+
+```bash
+bash run_docker.sh submit \
+  --config configs/config/qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k40_epoch2.yaml
+```
+
+Tamia uses Apptainer to execute the Docker-derived image. Docker is also
+supported where a daemon is available. See [container instructions](containers/README.md)
+for mounts, checks, alternative YAMLs, and direct Docker execution. Neither path
+uses the host Conda environment or `.runtime`.
 
 ## Quick Reproduction (Qwen3-4B-Base)
 
 Below is the complete from-scratch reproduction using Qwen3-4B-Base as student and Qwen3-8B as teacher. All commands are run from the `Lightning-OPD/` root directory; intermediate outputs are stored under `data/` and `checkpoints/`.
+
+The manual container commands below assume an existing container shell.
+On Tamia, use the [two-node H100 launcher](containers/README.md) above;
+`run_docker.sh` submits a Slurm job, and the prepared image already includes this repository and its dependencies.
 
 ```
 Lightning-OPD/
@@ -214,7 +275,7 @@ rm -rf data/rollouts/rank*
 
 ### Step 4: Precompute Teacher Log-Probabilities
 
-> Environment: **container** (`bash run_docker.sh`), Phase 1 is CPU only, Phase 2 needs GPU + sglang
+> Environment: **prepared container**, Phase 1 is CPU only, Phase 2 needs GPU + sglang
 
 This is the key step that eliminates the need for a live teacher during training.
 
@@ -248,7 +309,7 @@ After this step, you have a parquet file with precomputed `teacher_log_probs` fo
 
 ### Step 5: Lightning OPD Training
 
-> Environment: **container** (`bash run_docker.sh`, with `pip install -e .`)
+> Environment: **prepared container**
 
 Train the student model using precomputed data. No teacher server required.
 
@@ -268,7 +329,7 @@ Training uses Megatron + Ray with the slime framework. Key hyperparameters:
 
 ### Step 6: Convert Megatron Checkpoint to HuggingFace Format
 
-> Environment: **container** (`bash run_docker.sh`)
+> Environment: **prepared container**
 
 After training, the checkpoint is saved in Megatron distributed format. Convert it to HuggingFace format for evaluation and deployment:
 

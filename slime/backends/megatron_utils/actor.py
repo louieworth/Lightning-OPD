@@ -156,6 +156,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return start_rollout_id
 
+    def dispose(self):
+        # The update group also includes SGLang ranks. Both sides must enter
+        # teardown before destroying the trainer's remaining process groups.
+        updater = getattr(self, "weight_updater", None)
+        if updater is not None:
+            updater.dispose()
+        super().dispose()
+
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train

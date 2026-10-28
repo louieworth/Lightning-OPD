@@ -18,9 +18,6 @@ from slime.utils.tracking_utils import init_tracking
 def train(args):
     import json
     from pathlib import Path
-    import time
-
-    from slime.utils.walltime import CheckpointDeadlineReached
 
     configure_logger()
     # allocate the GPUs
@@ -65,47 +62,23 @@ def train(args):
             ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
 
     completed_steps = args.start_rollout_id
-    last_saved_step = completed_steps if completed_steps else None
-    paused = False
 
-    def checkpoint_deadline_reached():
-        deadline = getattr(args, "checkpoint_deadline", None)
-        return deadline is not None and time.time() >= deadline
+    def save_checkpoint(index):
+        from slime.utils.storage import check_checkpoint_space
 
-    def save_checkpoint(index, force_sync):
-        nonlocal last_saved_step
+        if args.save:
+            check_checkpoint_space(args.save, getattr(args, "hf_checkpoint", None))
         if (not args.use_critic) or (index >= args.num_critic_only_steps):
-            actor_model.save_model(index, force_sync=force_sync)
+            actor_model.save_model(index, force_sync=True)
         if args.use_critic:
-            critic_model.save_model(index, force_sync=force_sync)
+            critic_model.save_model(index, force_sync=True)
         if args.rollout_global_dataset:
             ray.get(rollout_manager.save.remote(index))
-        last_saved_step = index + 1
-
-    def pause_between_updates():
-        nonlocal paused
-        if completed_steps and last_saved_step != completed_steps:
-            # Evaluation uses the shared inference GPUs with training offloaded.
-            # Release those GPUs before restoring optimizer/model state to save.
-            if args.offload_rollout:
-                ray.get(rollout_manager.offload.remote())
-            if args.offload_train:
-                actor_model.onload()
-                if args.use_critic:
-                    critic_model.onload()
-            save_checkpoint(completed_steps - 1, force_sync=True)
-        paused = True
 
     def evaluate(index, eval_completed_steps):
-        try:
-            ray.get(rollout_manager.eval.remote(index, completed_steps=eval_completed_steps))
-        except CheckpointDeadlineReached:
-            pause_between_updates()
-            return False
-        return True
+        ray.get(rollout_manager.eval.remote(index, completed_steps=eval_completed_steps))
 
-    # Eval-only and an interrupted initial evaluation have no completed updates
-    # to checkpoint; the next allocation starts again from initialization.
+    # An initial evaluation has no training checkpoint to save or prune.
     if args.num_rollout == 0 and args.eval_interval is not None:
         evaluate(0, 0)
 
@@ -125,15 +98,9 @@ def train(args):
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        if paused:
-            break
-        if checkpoint_deadline_reached():
-            pause_between_updates()
-            break
         # TODO extract the duplicated eval logic
-        if args.eval_interval is not None and rollout_id == 0:
-            if not evaluate(rollout_id, 0):
-                break
+        if args.eval_interval is not None and rollout_id == 0 and getattr(args, 'val_before_train', False):
+            evaluate(rollout_id, 0)
 
         if block_coordinator is not None:
             block_coordinator.ensure_block(rollout_id)
@@ -152,24 +119,18 @@ def train(args):
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
         completed_steps = rollout_id + 1
-        stop_for_walltime = checkpoint_deadline_reached()
+        epoch_end = num_rollout_per_epoch is not None and completed_steps % num_rollout_per_epoch == 0
+        final_step = completed_steps == args.num_rollout
         if getattr(args, "save_final_only", False):
-            should_save = completed_steps == args.num_rollout
-        elif block_coordinator is not None:
-            should_save = rollout_id + 1 == block_coordinator.blocks[0]["end_step"]
+            should_save = final_step
         else:
             should_save = args.save_interval is not None and (
-                (rollout_id + 1) % args.save_interval == 0
-                or (num_rollout_per_epoch is not None and (rollout_id + 1) % num_rollout_per_epoch == 0)
+                completed_steps % args.save_interval == 0 or epoch_end or final_step
             )
-        if should_save or stop_for_walltime:
-            force_sync = stop_for_walltime or getattr(args, "save_final_only", False)
-            save_checkpoint(rollout_id, force_sync=force_sync)
-
-        if stop_for_walltime:
-            # Leave any pending evaluation to the next allocation as well.
-            paused = True
-            break
+        if should_save:
+            # Save the full model and data cursor before evaluation. The
+            # evaluator prunes older checkpoints only after writing its results.
+            save_checkpoint(rollout_id)
 
         # Policy lag: only sync rollout engine weights every update_weights_interval steps.
         # When lag > 1, the rollout engine runs with stale weights; IS correction
@@ -194,21 +155,25 @@ def train(args):
             ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE]))
 
         if args.eval_interval is not None and (
-            (rollout_id + 1) % args.eval_interval == 0
-            or (num_rollout_per_epoch is not None and (rollout_id + 1) % num_rollout_per_epoch == 0)
+            completed_steps % args.eval_interval == 0 or epoch_end or final_step
         ):
-            if not evaluate(rollout_id, rollout_id + 1):
-                break
+            evaluate(rollout_id, completed_steps)
 
+    actor_model.dispose()
+    if critic_model is not None:
+        critic_model.dispose()
     ray.get(rollout_manager.dispose.remote())
     if args.save:
         status = Path(args.save).parent / "training_status.json"
         temporary = status.with_suffix(".tmp.json")
-        temporary.write_text(json.dumps({"status": "paused" if paused else "complete",
+        temporary.write_text(json.dumps({"status": "complete",
                                          "global_step": completed_steps, "target_steps": args.num_rollout}) + "\n")
         temporary.replace(status)
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train(args)
+    try:
+        train(args)
+    finally:
+        ray.shutdown()

@@ -44,7 +44,7 @@ class BlockTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="lightning-block-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.cfg = yaml.safe_load((ROOT / "configs/config/qwen3_4b_lightning_opd.yaml").read_text())
+        self.cfg = yaml.safe_load((ROOT / "configs/config/qwen3_4b_base_nt_teacher_8b.yaml").read_text())
         self.cfg.update(output_dir=str(self.root), experiment_name="test", num_rollout=6,
                         rollout_batch_size=2, global_batch_size=2, policy_rollout_k=2,
                         eval_steps=2, rollout_max_prompt_len=8, rollout_max_response_len=4,
@@ -62,7 +62,7 @@ class BlockTests(unittest.TestCase):
         blocks.atomic_json(self.run / "initialization.json", self.models)
 
     def snapshot(self):
-        self.cfg["save_interval"] = blocks.schedule(self.cfg)[0]["end_step"]
+        self.cfg["save_interval"] = self.cfg["eval_steps"]
         path = self.run / "config.yaml"
         path.write_text(yaml.safe_dump(self.cfg))
         return types.SimpleNamespace(lightning_block_config=str(path), hf_checkpoint="student",
@@ -95,6 +95,70 @@ class BlockTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "block plan changed"):
             blocks.prepare_fixed_prompts(dict(self.cfg, policy_rollout_k=3), "student", Tokenizer())
 
+    def boundary_cache(self):
+        blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+        args = self.snapshot()
+        args.save = args.load = str(self.run / "checkpoints")
+        args.start_rollout_id = 0
+        checkpoint = Path(args.save) / "iter_0000002"
+        checkpoint.mkdir(parents=True)
+        for name in ("common.pt", ".metadata", "__0_0.distcp"):
+            (checkpoint / name).write_bytes(name.encode())
+        (Path(args.save) / "latest_checkpointed_iteration.txt").write_text("2")
+        policy = blocks.boundary_policy_id(args, self.cfg, self.models, 1, 3, "saved-policy")
+        self.assertEqual(policy, "saved-policy")
+        rollouts, scored = blocks.block_paths(self.cfg, 1)
+        identity = blocks.block_identity(self.cfg, self.models, 1, policy)
+        blocks.write_batches(rollouts, [[dict(response="saved") for _ in range(6)]], identity, 6)
+        args.start_rollout_id = 3
+        return args, checkpoint, rollouts, scored
+
+    def test_boundary_resume_reuses_checkpoint_bound_student_cache(self):
+        args, _, rollouts, _ = self.boundary_cache()
+        before = rollouts.read_bytes()
+        args.__dict__.update(offload_train=True, offload_rollout=True, update_weights_interval=1)
+        prepared, loaded, scored = [], [], []
+        manager = types.SimpleNamespace(
+            prepare_lightning_block=Remote(lambda *values: prepared.append(values)),
+            load_lightning_block=Remote(lambda *values: loaded.append(values)),
+            offload=Remote(lambda: None), onload=Remote(lambda **kwargs: None),
+        )
+        constants = types.SimpleNamespace(GPU_MEMORY_TYPE_WEIGHTS="weights", GPU_MEMORY_TYPE_KV_CACHE="kv")
+        with patch.dict(sys.modules, {"ray": types.SimpleNamespace(get=lambda value: value),
+                                      "sglang.srt.constants": constants}), \
+                patch.object(blocks, "score_teacher_block", lambda *values: scored.append(values[1:])):
+            blocks.BlockCoordinator(args, manager).ensure_block(3)
+        self.assertEqual(prepared, [(1, "saved-policy")])
+        self.assertEqual(scored, [(1, "saved-policy")])
+        self.assertEqual(loaded, [(1, 3, "saved-policy")])
+        self.assertEqual(rollouts.read_bytes(), before)
+
+    def test_boundary_resume_reuses_complete_teacher_cache_without_student_file(self):
+        args, _, rollouts, scored = self.boundary_cache()
+        rollouts.replace(scored)
+        rollouts.with_suffix(".manifest.json").replace(scored.with_suffix(".manifest.json"))
+        self.assertEqual(blocks.boundary_policy_id(args, self.cfg, self.models, 1, 3, "new"), "saved-policy")
+
+    def test_boundary_resume_rejects_changed_checkpoint(self):
+        args, checkpoint, _, _ = self.boundary_cache()
+        (checkpoint / "common.pt").write_bytes(b"another training trajectory")
+        self.assertEqual(blocks.boundary_policy_id(args, self.cfg, self.models, 1, 3, "new"), "new")
+
+    def test_boundary_resume_rejects_changed_recipe(self):
+        args, _, _, _ = self.boundary_cache()
+        changed = dict(self.cfg, seed=self.cfg["seed"] + 1)
+        self.assertEqual(blocks.boundary_policy_id(args, changed, self.models, 1, 3, "new"), "new")
+
+    def test_boundary_cache_is_not_reused_by_a_fresh_training_path(self):
+        args, _, _, _ = self.boundary_cache()
+        args.start_rollout_id = 0
+        self.assertEqual(blocks.boundary_policy_id(args, self.cfg, self.models, 1, 3, "new"), "new")
+
+    def test_boundary_resume_does_not_adopt_unbound_legacy_cache(self):
+        args, _, rollouts, _ = self.boundary_cache()
+        (rollouts.parent / "policy_checkpoint.json").unlink()
+        self.assertEqual(blocks.boundary_policy_id(args, self.cfg, self.models, 1, 3, "new"), "new")
+
     def test_real_parquet_generation_and_teacher_alignment(self):
         blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
         args = self.snapshot()
@@ -118,7 +182,10 @@ class BlockTests(unittest.TestCase):
 
         launcher = types.SimpleNamespace(request=request, background=background,
                                          server_command=lambda *args: [], wait_ready=lambda *args: None)
-        transformers = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()))
+        transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()),
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **kw: types.SimpleNamespace(vocab_size=151936)),
+        )
         with patch.dict(sys.modules, {"configs.opd.qwen3-4b-opd": launcher, "transformers": transformers}):
             blocks.prepare_student_block(manager, 0, "initial")
             blocks.score_teacher_block(args, 0, "initial")
@@ -159,7 +226,7 @@ class BlockTests(unittest.TestCase):
                 self.assertEqual(manager.data_source.sample_offset, 0)
                 self.assertEqual(manager.data_source.sample_index, 6)
                 self.assertEqual(manager.data_source.metadata["lightning_global_sample_offset"], 6)
-                # A walltime checkpoint can stop inside a later block. Resume
+                # An evaluation checkpoint can be inside a later block. Resume
                 # its original cached policy, rather than generating new data.
                 args.__dict__.update(offload_train=True, offload_rollout=True, update_weights_interval=1)
                 manager.data_source.metadata["lightning_global_sample_offset"] = 8
@@ -193,6 +260,48 @@ class BlockTests(unittest.TestCase):
             self.assertTrue(blocks.cached(blocks.block_paths(self.cfg, 1)[1],
                                           blocks.block_identity(self.cfg, self.models, 1, "updated"), 6))
 
+    def test_teacher_boundary_labels_score_cached_original_response_tokens(self):
+        blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+        args = self.snapshot()
+        manager = types.SimpleNamespace(args=args)
+        tokens = [151934, 151935, 0]
+        teacher_requests = []
+
+        def request(url, payload):
+            if payload["sampling_params"]["max_new_tokens"]:
+                return dict(meta_info=dict(output_token_logprobs=[[-.5, token, ""] for token in tokens],
+                                           finish_reason={"type": "stop"}))
+            ids = payload["input_ids"]
+            teacher_requests.append(ids[-len(tokens):])
+            # The installed SGLang scores original IDs, but clips these labels.
+            items = [[None, ids[0], ""]] + [[-.2, token if token < 151935 else 0, ""] for token in ids[1:]]
+            return dict(meta_info=dict(input_token_logprobs=items))
+
+        @contextlib.contextmanager
+        def background(*args):
+            yield object()
+
+        launcher = types.SimpleNamespace(request=request, background=background, server_command=lambda *a: [],
+                                         wait_ready=lambda *a: None)
+        transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()),
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **kw: types.SimpleNamespace(vocab_size=151936)),
+        )
+        with patch.dict(sys.modules, {"configs.opd.qwen3-4b-opd": launcher, "transformers": transformers}):
+            blocks.prepare_student_block(manager, 0, "initial")
+            rollouts, scored = blocks.block_paths(self.cfg, 0)
+            original = rollouts.read_bytes()
+            blocks.score_teacher_block(args, 0, "initial")
+            rows = pq.read_table(scored).to_pylist()
+            self.assertEqual(len(rows), 6)
+            self.assertEqual(teacher_requests, [tokens] * 6)
+            self.assertEqual(rollouts.read_bytes(), original)
+            for row in rows:
+                self.assertEqual(row["metadata"]["response_tokens"], tokens)
+                self.assertEqual(row["metadata"]["teacher_log_probs"], [-.2] * 3)
+            blocks.score_teacher_block(args, 0, "initial")
+            self.assertEqual(len(teacher_requests), 6)
+
     def test_teacher_feature_upgrade_preserves_saved_rollout_policy_and_resume_cursor(self):
         blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
         args = self.snapshot()
@@ -219,7 +328,10 @@ class BlockTests(unittest.TestCase):
 
         launcher = types.SimpleNamespace(request=request, background=background, server_command=lambda *a: [],
                                          wait_ready=lambda *a: None)
-        transformers = types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: Tokenizer()))
+        transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: Tokenizer()),
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: types.SimpleNamespace(vocab_size=151936)),
+        )
         with patch.dict(sys.modules, {"configs.opd.qwen3-4b-opd": launcher, "transformers": transformers}):
             blocks.prepare_student_block(manager, 0, "initial")
             blocks.score_teacher_block(args, 0, "initial")
@@ -255,7 +367,7 @@ class BlockTests(unittest.TestCase):
             self.assertEqual(loaded, [(0, 1, "initial")])
             self.assertEqual(calls, {"generation": 6, "features": 6})
 
-    def test_driver_refreshes_policy_but_keeps_global_eval_and_saves_once(self):
+    def test_driver_refreshes_policy_and_saves_at_global_evaluation_steps(self):
         function = next(item for item in ast.parse((ROOT / "train.py").read_text()).body
                         if isinstance(item, ast.FunctionDef) and item.name == "train")
         constants = types.SimpleNamespace(GPU_MEMORY_TYPE_WEIGHTS="weights", GPU_MEMORY_TYPE_KV_CACHE="kv",
@@ -266,6 +378,7 @@ class BlockTests(unittest.TestCase):
                 self.cfg["policy_rollout_k"] = k
                 args = self.snapshot()
                 args.__dict__.update(num_rollout=150, start_rollout_id=0, eval_interval=25, eval_on_resume=False,
+                                     val_before_train=True,
                                      offload_train=True, offload_rollout=True, enable_weights_backuper=False,
                                      use_critic=False, rollout_global_dataset=True, rollout_batch_size=256,
                                      save_interval=self.cfg["save_interval"], update_weights_interval=1, save=None)
@@ -302,7 +415,8 @@ class BlockTests(unittest.TestCase):
 
                 actor = types.SimpleNamespace(async_train=train, save_model=lambda index, **kw: stage("save", index),
                                               update_weights=lambda: None, clear_memory=lambda: None,
-                                              onload=lambda: state.update(train_loaded=True), offload=offload)
+                                              onload=lambda: state.update(train_loaded=True), offload=offload,
+                                              dispose=lambda: None)
 
                 def score(args, index, policy):
                     self.assertFalse(state["train_loaded"])
@@ -322,84 +436,90 @@ class BlockTests(unittest.TestCase):
                 self.assertEqual([value for name, value in events if name == "prepare"], list(range(k)))
                 self.assertEqual([value for name, value in events if name == "teacher"], list(range(k)))
                 self.assertEqual([value for name, value in events if name == "eval"], [0, 24, 49, 74, 99, 124, 149])
-                self.assertEqual([value for name, value in events if name == "save"], [self.cfg["save_interval"] - 1])
+                self.assertEqual([value for name, value in events if name == "save"], [24, 49, 74, 99, 124, 149])
                 self.assertEqual([value for name, value in events if name == "train"], list(range(150)))
                 self.assertEqual(state["step"], 150)
-                # Resume from the only saved checkpoint; global steps do not reset.
+                # Resuming inside a block keeps its original cached policy.
+                manager.lightning_resume_metadata = Remote(lambda: dict(
+                    lightning_block_index=next(item["index"] for item in blocks.schedule(self.cfg)
+                        if item["start_step"] <= args.start_rollout_id < item["end_step"]),
+                    lightning_policy_id="saved-policy",
+                    lightning_global_sample_offset=args.start_rollout_id * self.cfg["rollout_batch_size"]))
                 events.clear()
                 args.start_rollout_id = self.cfg["save_interval"]
                 state.update(step=args.start_rollout_id, train_loaded=False)
                 with patch.dict(sys.modules, {"ray": ray, "sglang.srt.constants": constants}), \
                         patch.object(blocks, "score_teacher_block", score):
                     namespace["train"](args)
-                self.assertEqual([value for name, value in events if name == "prepare"], list(range(1, k)))
-                self.assertEqual([value for name, value in events if name == "save"], [])
+                self.assertEqual([value for name, value in events if name == "prepare"],
+                                 [item["index"] for item in blocks.schedule(self.cfg)
+                                  if item["start_step"] >= args.start_rollout_id])
+                self.assertEqual([value for name, value in events if name == "save"], [49, 74, 99, 124, 149])
                 self.assertEqual([value for name, value in events if name == "train"], list(range(args.start_rollout_id, 150)))
                 self.assertEqual([value for name, value in events if name == "eval"],
                                  [i for i in (24, 49, 74, 99, 124, 149) if i >= args.start_rollout_id])
 
-    def test_launcher_keeps_standard_opd_save_policy(self):
+    def test_launcher_uses_evaluation_checkpoint_policy_for_both_methods(self):
         spec = importlib.util.spec_from_file_location("block_launcher_test", ROOT / "configs/opd/qwen3-4b-opd.py")
         launcher = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(launcher)
-        cfg = launcher.read_config(ROOT / "configs/config/qwen3_4b_lightning_opd.yaml", "lightning_opd")
-        self.assertEqual(cfg["save_interval"], 150)
+        cfg = launcher.read_config(ROOT / "configs/config/qwen3_4b_base_nt_teacher_8b.yaml", "lightning_opd")
+        self.assertEqual(cfg["save_interval"], cfg["eval_steps"])
         flags = launcher.training_args(cfg, "student", None, "/tmp/eval.yaml")
         self.assertIn("--lightning-block-config", flags)
         self.assertNotIn("--policy-rollout-k", flags)
+        self.assertNotIn("--save-final-only", flags)
         self.assertEqual(flags[flags.index("--rollout-function-path") + 1],
                          "slime.rollout.lightning_opd_blocks.generate_cached_rollout")
-        base = yaml.safe_load((ROOT / "configs/config/qwen3_4b_lightning_opd.yaml").read_text())
+        base = yaml.safe_load((ROOT / "configs/config/qwen3_4b_base_nt_teacher_8b.yaml").read_text())
         temporary = self.root / "launcher.yaml"
-        temporary.write_text(yaml.safe_dump(dict(base, policy_rollout_k=4)))
-        self.assertEqual(launcher.read_config(temporary, "lightning_opd")["save_interval"], 150)
-        for change in (dict(policy_rollout_k=True), dict(policy_rollout_k=0), dict(policy_rollout_k=151),
-                       dict(rollout_shuffle=True), dict(save_model="active"), dict(save_eval_multiplier=2)):
+        for k in (1, 2, 4, 40):
+            temporary.write_text(yaml.safe_dump(dict(base, policy_rollout_k=k)))
+            self.assertEqual(launcher.read_config(temporary, "lightning_opd")["save_interval"], base["eval_steps"])
+        for change in (dict(policy_rollout_k=True), dict(policy_rollout_k=0),
+                       dict(policy_rollout_k=base["num_rollout"] + 1), dict(rollout_shuffle=True),
+                       dict(save_model="invalid"), dict(save_eval_multiplier=0)):
             temporary.write_text(yaml.safe_dump(dict(base, **change)))
             with self.assertRaises(ValueError):
                 launcher.read_config(temporary, "lightning_opd")
-        opd = launcher.read_config(ROOT / "configs/config/qwen3_4b_opd.yaml", "opd")
-        self.assertEqual((opd["save_model"], opd["save_interval"]), ("final", 150))
-        self.assertIn("--save-final-only", launcher.training_args(opd, "student", None, "/tmp/eval.yaml"))
-        self.assertIn("--save-final-only", flags)
-        legacy = dict(base, policy_rollout_k=4)
-        legacy.pop("save_model")
-        temporary.write_text(yaml.safe_dump(legacy))
-        self.assertEqual(launcher.read_config(temporary, "lightning_opd")["save_interval"], 38)
-        standard = yaml.safe_load((ROOT / "configs/config/qwen3_4b_opd.yaml").read_text())
-        temporary.write_text(yaml.safe_dump(dict(standard, save_model="active", save_eval_multiplier=2)))
-        self.assertEqual(launcher.read_config(temporary, "opd")["save_interval"], 50)
+        opd = launcher.read_config(ROOT / "configs/config/qwen3_4b_base_opd_nt_teacher_8b.yaml", "opd")
+        self.assertEqual((opd["save_model"], opd["save_interval"]), ("active", opd["eval_steps"]))
+        self.assertNotIn("--save-final-only", launcher.training_args(opd, "student", None, "/tmp/eval.yaml"))
+        default = dict(base, policy_rollout_k=4)
+        default.pop("save_model")
+        temporary.write_text(yaml.safe_dump(default))
+        self.assertEqual(launcher.read_config(temporary, "lightning_opd")["save_interval"], base["eval_steps"])
+        for method, source in (("lightning_opd", base), ("opd", opd)):
+            temporary.write_text(yaml.safe_dump(dict(source, save_model="active", save_eval_multiplier=2)))
+            self.assertEqual(launcher.read_config(temporary, method)["save_interval"], source["eval_steps"] * 2)
 
-    def test_final_and_walltime_saves_are_synchronous_and_preserve_update_cursor(self):
+    def test_evaluation_saves_are_synchronous_and_preserve_update_cursor(self):
         function = next(item for item in ast.parse((ROOT / "train.py").read_text()).body
                         if isinstance(item, ast.FunctionDef) and item.name == "train")
         for lightning in (False, True):
-            for stop_at in (None, 2, 4, 6):
-                with self.subTest(lightning=lightning, stop_at=stop_at):
-                    events, state = [], {"step": 0}
+            for final_only in (False, True):
+                with self.subTest(lightning=lightning, final_only=final_only):
+                    events = []
                     args = types.SimpleNamespace(
                         num_rollout=6, start_rollout_id=0, eval_interval=2, eval_on_resume=False,
                         offload_train=False, offload_rollout=False, enable_weights_backuper=False,
                         use_critic=False, rollout_global_dataset=True, rollout_batch_size=2,
-                        save_interval=6, save_final_only=True, update_weights_interval=1,
-                        checkpoint_deadline=10 if stop_at else None, save=str(self.run / "checkpoints"),
+                        save_interval=6 if final_only else 2, save_final_only=final_only,
+                        update_weights_interval=1, save=str(self.run / "checkpoints"),
                         lightning_block_config="unused" if lightning else None,
                     )
                     def event(name, value=None):
                         events.append((name, value))
-                    def update(index, data):
-                        state["step"] = index + 1
-                        event("train", index)
                     def save(index, force_sync=False):
                         self.assertTrue(force_sync)
                         event("save", index)
-                    actor = types.SimpleNamespace(async_train=update, save_model=save,
-                                                  update_weights=lambda: None, clear_memory=lambda: None)
+                    actor = types.SimpleNamespace(async_train=lambda i, data: event("train", i), save_model=save,
+                                                  update_weights=lambda: None, clear_memory=lambda: None,
+                                                  dispose=lambda: event("dispose_train"))
                     manager = types.SimpleNamespace(
                         generate=Remote(lambda index: None),
-                        eval=Remote(lambda index=None, **kw: event("eval", kw.get("rollout_id", index))),
-                        save=Remote(lambda index: event("cursor", index)),
-                        dispose=Remote(lambda: event("dispose")),
+                        eval=Remote(lambda index, completed_steps: event("eval", completed_steps)),
+                        save=Remote(lambda index: event("cursor", index)), dispose=Remote(lambda: event("dispose")),
                     )
                     coordinator = types.SimpleNamespace(ensure_block=lambda index: None)
                     ray = types.SimpleNamespace(get=lambda value: value)
@@ -408,20 +528,22 @@ class BlockTests(unittest.TestCase):
                                      init_tracking=lambda args: None, create_placement_groups=lambda args: {"rollout": None},
                                      create_rollout_manager=lambda *args: (manager, 2),
                                      create_training_models=lambda *args: (actor, None))
-                    with patch.object(blocks, "BlockCoordinator", return_value=coordinator), \
-                            patch("time.time", side_effect=lambda: 20 if stop_at and state["step"] >= stop_at else 0):
+                    with patch.object(blocks, "BlockCoordinator", return_value=coordinator):
                         exec(compile(ast.Module(body=[function], type_ignores=[]), "train.py", "exec"), namespace)
                         namespace["train"](args)
-                    completed = stop_at or 6
-                    self.assertEqual([v for n, v in events if n == "train"], list(range(completed)))
-                    self.assertEqual([v for n, v in events if n == "save"], [completed - 1])
-                    self.assertEqual([v for n, v in events if n == "cursor"], [completed - 1])
-                    self.assertEqual([v for n, v in events if n == "eval"],
-                                     [0] + [i for i in (1, 3, 5) if i < completed - bool(stop_at)])
+                    expected = [5] if final_only else [1, 3, 5]
+                    self.assertEqual([v for n, v in events if n == "train"], list(range(6)))
+                    self.assertEqual([v for n, v in events if n == "save"], expected)
+                    self.assertEqual([v for n, v in events if n == "cursor"], expected)
+                    self.assertEqual([v for n, v in events if n == "eval"], [2, 4, 6])
+                    for index in expected:
+                        self.assertLess(events.index(("save", index)), events.index(("cursor", index)))
+                        self.assertLess(events.index(("cursor", index)), events.index(("eval", index + 1)))
                     self.assertEqual(events[-1], ("dispose", None))
+                    self.assertLess(events.index(("eval", 6)), events.index(("dispose_train", None)))
+                    self.assertLess(events.index(("dispose_train", None)), events.index(("dispose", None)))
                     status = json.loads((self.run / "training_status.json").read_text())
-                    self.assertEqual(status, dict(status="paused" if stop_at else "complete",
-                                                  global_step=completed, target_steps=6))
+                    self.assertEqual(status, dict(status="complete", global_step=6, target_steps=6))
 
     def test_fixed_sampler_checks_absolute_batch_positions(self):
         rows = [types.SimpleNamespace(metadata=dict(lightning_sample_index=i, policy_block_index=1)) for i in (6, 7)]
@@ -450,9 +572,9 @@ class BlockTests(unittest.TestCase):
                 self.cfg.update(policy_rollout_k=k, experiment_name=f"eval-k{k}")
                 run = blocks.run_directory(self.cfg)
                 run.mkdir()
-                self.cfg["save_interval"] = blocks.schedule(self.cfg)[0]["end_step"]
+                self.cfg["save_interval"] = self.cfg["eval_steps"]
                 (run / "config.yaml").write_text(yaml.safe_dump(self.cfg))
-                latest = self.cfg["save_interval"] - 1
+                latest = 49
                 checkpoint = run / "checkpoints"
                 weights = checkpoint / f"iter_{latest:07d}"
                 weights.mkdir(parents=True)
@@ -471,7 +593,7 @@ class BlockTests(unittest.TestCase):
                 flags = launcher.training_args(self.cfg, "student", None, "/tmp/eval.yaml")
                 self.assertNotIn("--eval-on-resume", flags)
                 if k == 2:
-                    (run / "eval_metrics/74.json").unlink()
+                    (run / "eval_metrics/49.json").unlink()
                     flags = launcher.training_args(self.cfg, "student", None, "/tmp/eval.yaml")
                     self.assertIn("--eval-on-resume", flags)
                 launcher.check_run_state(self.cfg, "student", "teacher")

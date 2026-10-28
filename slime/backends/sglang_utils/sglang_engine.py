@@ -12,7 +12,6 @@ import sglang_router
 from packaging.version import parse
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-from urllib3.exceptions import NewConnectionError
 
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
@@ -254,19 +253,19 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
         # flush cache will not return status_code 200 when there are pending requests
-        for _ in range(60):
+        deadline = time.monotonic() + 60
+        while (remaining := deadline - time.monotonic()) > 0:
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                response = requests.get(
+                    f"http://{self.server_host}:{self.server_port}/flush_cache",
+                    timeout=min(5.0, remaining),
+                )
                 if response.status_code == 200:
-                    break
-            except NewConnectionError as e:
-                raise e
-            except Exception as e:
+                    return
+            except requests.RequestException as e:
                 logger.info(f"Error flushing cache: {e}")
-                time.sleep(1)
-                continue
-        else:
-            raise TimeoutError("Timeout while flushing cache.")
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+        raise TimeoutError("Timeout while flushing cache.")
 
     def shutdown(self):
         if self.args.rollout_external:
@@ -311,8 +310,23 @@ class SGLangEngine(RayActor):
         return response.json()["weight_version"]
 
     def release_memory_occupation(self):
-        self.flush_cache()
-        return self._make_request("release_memory_occupation")
+        if self.node_rank != 0:
+            return
+        # /health also generates a token in SGLang 0.5.5. Keep its requests
+        # out of the scheduler between flush_cache and memory release.
+        self.pause_generation()
+        try:
+            self.flush_cache()
+            result = self._make_request("release_memory_occupation")
+        except Exception:
+            try:
+                self.continue_generation()
+            except requests.RequestException:
+                logger.exception("Failed to unpause generation after memory offload failed")
+            raise
+        # Once offload_tags are set, SGLang skips health-check generation.
+        self.continue_generation()
+        return result
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """

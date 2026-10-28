@@ -46,6 +46,13 @@ class UpdateWeightFromDistributed:
         self._model_update_groups = None
         self.rollout_engines = []
 
+    def dispose(self):
+        if self._model_update_groups is not None:
+            disconnect_rollout_engines_from_distributed(
+                self.args, self._group_name, self._model_update_groups, self.rollout_engines
+            )
+            self._model_update_groups = None
+
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
     ) -> None:

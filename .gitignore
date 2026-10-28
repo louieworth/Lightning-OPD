@@ -5,9 +5,21 @@ __pycache__/
 *.egg
 dist/
 build/
+.venv/
+venv/
+
+# Test, lint, and coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # Logs
 *.log
+slurm-*.out
+slurm-*.err
 /tmp/
 
 # IDE
@@ -15,6 +27,7 @@ build/
 .idea/
 *.swp
 *.swo
+.claude/settings.local.json
 
 # OS
 .DS_Store
@@ -23,8 +36,13 @@ build/
 data/
 .runtime/
 checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
 *.arrow
 *.sqsh
+*.sif
 *.parquet
 wandb/
 

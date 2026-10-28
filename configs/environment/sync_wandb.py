@@ -16,12 +16,13 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from slime.utils.wandb_metrics import EVAL_STEP_METRIC, EXCLUDED_WANDB_PREFIXES, filter_wandb_metrics
-from slime.utils.wandb_run_ids import resolve_wandb_run_id
+from slime.utils.wandb_metrics import EVAL_STEP_METRIC, EXCLUDED_WANDB_PREFIXES, filter_wandb_metrics  # noqa: E402
+from slime.utils.wandb_run_ids import resolve_wandb_run_id  # noqa: E402
+from slime.utils.wandb_paths import wandb_source_roots  # noqa: E402
 
 
 def eval_metric_axis_definitions(definitions, metric_names, fields, axis_name=EVAL_STEP_METRIC):
-    """Restore Avg@1 axes without moving indices used by other metrics."""
+    """Restore evaluation axes without moving indices used by other metrics."""
     result = deepcopy(definitions)
     name_key = fields["name"]
     glob_key = fields["glob_name"]
@@ -94,7 +95,7 @@ def deduplicate_eval_metrics(metrics, seen):
     return retained
 
 
-def filtered_run_file(log, destination, seen_eval_points=None):
+def filtered_run_file(log, destination, seen_eval_points=None, eval_samples_per_dataset=None):
     """Upload a filtered snapshot; never edit a training process's original log."""
     from wandb.proto import wandb_internal_pb2
     from wandb.sdk.internal.datastore import DataStore
@@ -129,7 +130,7 @@ def filtered_run_file(log, destination, seen_eval_points=None):
                 items = record.history.item if kind == "history" else record.summary.update
                 values = {(item.key or "/".join(item.nested_key)): json.loads(item.value_json)
                           for item in items}
-                retained = filter_wandb_metrics(values)
+                retained = filter_wandb_metrics(values, eval_samples_per_dataset)
                 if kind == "history":
                     retained = deduplicate_eval_metrics(retained, seen_eval_points)
                 elif seen_eval_points:
@@ -162,6 +163,9 @@ def filtered_run_file(log, destination, seen_eval_points=None):
                     metric.options.hidden = True
                 elif original_name.startswith(EXCLUDED_WANDB_PREFIXES):
                     continue
+                elif metric.name and original_name.startswith("eval_metric/"):
+                    metric.name = next(iter(filter_wandb_metrics(
+                        {original_name: 0}, eval_samples_per_dataset)))
                 if metric.step_metric_index:
                     metric.step_metric = metric_names[metric.step_metric_index - 1]
                     metric.ClearField("step_metric_index")
@@ -273,12 +277,13 @@ def main():
     launcher = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(launcher)
     launcher.load_env(args.env_file or cfg.get("env_file") or ROOT / ".env")
+    wandb = launcher.wandb_env()
+    project, entity = wandb["WANDB_PROJECT"], wandb.get("WANDB_ENTITY")
 
     if args.repair_eval_axis:
         if args.paths or args.all_experiments:
             parser.error("Use --repair-eval-axis without run paths or --all-experiments.")
-        repair_eval_metric_axes(args.repair_eval_axis, cfg["project_name"],
-                                cfg.get("wandb_entity") or os.environ.get("WANDB_ENTITY"), args.dry_run)
+        repair_eval_metric_axes(args.repair_eval_axis, project, entity, args.dry_run)
         return
 
     if args.paths:
@@ -288,29 +293,43 @@ def main():
                 parser.error(f"Run path does not exist: {root}")
     elif args.all_experiments:
         output = Path(cfg["output_dir"]).expanduser().resolve()
-        roots = sorted(output.glob("*/wandb"))
+        roots = sorted(output.glob("*/wandb")) + [ROOT / "wandb"]
     else:
-        roots = [launcher.run_dir(cfg) / "wandb"]
+        roots = wandb_source_roots(cfg, ROOT, launcher.run_dir(cfg))
 
     logs = offline_logs(roots, args.include_synced)
     if not logs:
         print("No unsynced offline WandB runs found in: " + ", ".join(map(str, roots)))
         return
 
-    # Only the upload subprocess uses online mode; training stays offline.
+    # Only the upload subprocess forces online mode.
     env = os.environ.copy()
+    env.update(wandb)
     env["WANDB_MODE"] = "online"
-    if not env.get("WANDB_API_KEY") and env.get("WANDB_KEY"):
-        env["WANDB_API_KEY"] = env["WANDB_KEY"]
     env.pop("WANDB_KEY", None)
-    python = env.get("LIGHTNING_OPD_PYTHON") or cfg["python_executable"]
-    project = cfg["project_name"]
-    entity = cfg.get("wandb_entity") or env.get("WANDB_ENTITY")
+    python = env.get("LIGHTNING_OPD_PYTHON") or cfg.get("python_executable") or sys.executable
     print(f"{'Would sync' if args.dry_run else 'Syncing'} {len(logs)} offline run file(s) to {entity or '<default entity>'}/{project}.")
     snapshots = tempfile.TemporaryDirectory(prefix="lightning-opd-wandb-filtered-")
     eval_points = {}
     api = None
     for log in logs:
+        # --all-experiments may contain runs with different val_n values.
+        experiment = cfg
+        for parent in log.parents:
+            candidates = [parent / "config.yaml"]
+            if parent.name:
+                candidates.append(Path(cfg["output_dir"]) / parent.name / "config.yaml")
+            found = False
+            for saved_config in candidates:
+                if saved_config.is_file():
+                    candidate = yaml.safe_load(saved_config.read_text())
+                    if isinstance(candidate, dict) and "val_n" in candidate:
+                        experiment, found = candidate, True
+                        break
+            if found:
+                break
+        eval_samples = {Path(source).stem: experiment["val_n"]
+                        for source in experiment.get("val_files", [])}
         original_id = log.stem.removeprefix("run-")
         run_id = resolve_wandb_run_id(original_id, entity, project)
         if not args.dry_run and run_id not in eval_points:
@@ -332,7 +351,7 @@ def main():
                     and key.startswith("eval_metric/") and value is not None
                 }
         upload = log if args.dry_run else filtered_run_file(
-            log, Path(snapshots.name), eval_points[run_id])
+            log, Path(snapshots.name), eval_points[run_id], eval_samples)
         command = [python, "-m", "wandb", "sync", "--append", "--no-sync-tensorboard", "--mark-synced", "--project", project]
         if entity:
             command.extend(["--entity", entity])
@@ -345,7 +364,7 @@ def main():
             if Path(str(upload) + ".synced").exists():
                 Path(str(log) + ".synced").touch()
 
-    # Each process stream can replace W&B's metric definitions. Restore the Avg@1
+    # Each process stream can replace W&B's metric definitions. Restore the eval
     # binding once the last stream has uploaded, using the configured interpreter.
     run_ids = sorted({log.stem.removeprefix("run-") for log in logs})
     command = [python, str(Path(__file__).resolve()), "--config", str(args.config),

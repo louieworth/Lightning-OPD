@@ -1,4 +1,4 @@
-"""CPU checks for evaluation deadlines and continuation of the actual data cursor."""
+"""CPU checks for complete evaluations and continuation of the actual data cursor."""
 
 import ast
 import asyncio
@@ -11,14 +11,11 @@ from pathlib import Path
 import pickle
 import random
 import tempfile
-import time
 import types
 import unittest
 from typing import Any
 
 import yaml
-
-from slime.utils.walltime import CheckpointDeadlineReached, evaluation_before_deadline
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,13 +81,16 @@ class ResumeTests(unittest.TestCase):
         launcher = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(launcher)
         with tempfile.TemporaryDirectory(prefix="opd-recipe-test-") as directory:
-            cfg = yaml.safe_load((ROOT / "configs/config/qwen3_4b_opd.yaml").read_text())
+            cfg = yaml.safe_load((ROOT / "configs/config/qwen3_4b_base_opd_nt_teacher_8b.yaml").read_text())
             cfg.update(output_dir=directory, experiment_name="test", resume=True)
             run = launcher.run_dir(cfg)
             weights = run / "checkpoints/iter_0000002"
             weights.mkdir(parents=True)
             (weights / "weights.pt").write_bytes(b"weights")
-            (run / "config.yaml").write_text(yaml.safe_dump(cfg))
+            # Existing final-only checkpoints remain resumable after changing
+            # the save schedule to one checkpoint per evaluation.
+            previous = dict(cfg, save_model="final", save_interval=cfg["num_rollout"])
+            (run / "config.yaml").write_text(yaml.safe_dump(previous))
             (weights.parent / "latest_checkpointed_iteration.txt").write_text("2")
             cursor = weights.parent / "rollout/global_dataset_state_dict_2.pt"
             cursor.parent.mkdir()
@@ -116,94 +116,24 @@ class ResumeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "rollout cursor"):
                 launcher.check_run_state(cfg, "student", "teacher")
 
-    def test_long_evaluation_cancels_every_request_without_partial_results(self):
-        cancelled, events = [], []
+    def test_evaluation_waits_for_all_dataset_requests(self):
+        completed = []
 
-        async def generate(args, sample, **kwargs):
-            try:
-                await asyncio.sleep(60)
-            finally:
-                cancelled.append(sample.index)
+        async def dataset_eval(args, index, dataset):
+            await asyncio.sleep(0.01 if dataset.name == "a" else 0.02)
+            completed.append(dataset.name)
+            return {dataset.name: {"samples": [dataset.name]}}
 
-        async def abort(args, index):
-            events.append("abort")
-
-        class Progress:
-            def __init__(self, **kwargs):
-                pass
-            def update(self, count):
-                pass
-            def close(self):
-                events.append("closed")
-
-        dataset = types.SimpleNamespace(cache_key=("test",), temperature=0.7, top_p=0.8, top_k=20,
-                                        max_response_len=16384, n_samples_per_eval_prompt=1,
-                                        inject_metadata=lambda metadata: metadata)
-        args = types.SimpleNamespace(group_rm=False, eval_datasets=[dataset], hf_checkpoint="student",
-                                     apply_chat_template=True, rollout_stop=None, rollout_stop_token_ids=None,
-                                     rollout_skip_special_tokens=True, checkpoint_deadline=None)
-        namespace = dict(asyncio=asyncio, copy=copy, Namespace=types.SimpleNamespace,
-                         EvalDatasetConfig=types.SimpleNamespace, Sample=types.SimpleNamespace, Any=Any,
-                         RolloutFnEvalOutput=types.SimpleNamespace, tqdm=Progress, abort=abort,
-                         generate_and_rm=generate, logger=logging.getLogger(__name__),
-                         evaluation_before_deadline=evaluation_before_deadline,
-                         CheckpointDeadlineReached=CheckpointDeadlineReached,
-                         EVAL_PROMPT_DATASET={("test", "student", True): types.SimpleNamespace(
-                             samples=[types.SimpleNamespace(metadata={}) for _ in range(3)])})
-        definitions("slime/rollout/sglang_rollout.py", {"eval_rollout", "eval_rollout_single_dataset"}, namespace)
-        args.checkpoint_deadline = time.time() + 0.05
-        with self.assertRaises(CheckpointDeadlineReached):
-            asyncio.run(namespace["eval_rollout"](args, 24))
-        self.assertEqual(sorted(cancelled), [0, 1, 2])
-        self.assertEqual(events, ["closed", "abort"])
-
-    def test_evaluation_pause_saves_last_update_after_restoring_training_workers(self):
-        for start, stop in ((0, 0), (0, 2), (0, 6), (2, 2), (3, 4)):
-            with self.subTest(start=start, stop=stop), tempfile.TemporaryDirectory(prefix="opd-eval-stop-") as directory:
-                events, state = [], {"step": start}
-                remote = lambda function: types.SimpleNamespace(remote=function)
-                def event(name, value=None):
-                    events.append((name, value))
-                def update(index, data):
-                    state["step"] = index + 1
-                    event("train", index)
-                def evaluate(index, completed_steps=None):
-                    self.assertEqual(completed_steps, state["step"])
-                    event("eval", completed_steps)
-                    if state["step"] == stop:
-                        raise CheckpointDeadlineReached("deadline")
-                def save(index, force_sync=False):
-                    self.assertTrue(force_sync)
-                    event("save", index)
-                actor = types.SimpleNamespace(async_train=update, save_model=save,
-                    update_weights=lambda: None, clear_memory=lambda: None,
-                    onload=lambda: event("train_onload"), offload=lambda: event("train_offload"))
-                manager = types.SimpleNamespace(generate=remote(lambda index: None), eval=remote(evaluate),
-                    offload=remote(lambda: event("rollout_offload")), onload=remote(lambda **kw: None),
-                    save=remote(lambda index: event("cursor", index)), dispose=remote(lambda: None))
-                args = types.SimpleNamespace(num_rollout=6, start_rollout_id=start, eval_interval=2,
-                    eval_on_resume=bool(start), offload_train=True, offload_rollout=True,
-                    enable_weights_backuper=False, use_critic=False, rollout_global_dataset=True,
-                    save_interval=6, save_final_only=True, update_weights_interval=1,
-                    checkpoint_deadline=None, save=str(Path(directory) / "checkpoints"))
-                namespace = dict(ray=types.SimpleNamespace(get=lambda value: value),
-                    GPU_MEMORY_TYPE_WEIGHTS="weights", GPU_MEMORY_TYPE_KV_CACHE="kv", GPU_MEMORY_TYPE_CUDA_GRAPH=None,
-                    configure_logger=lambda: None, init_tracking=lambda args: None,
-                    create_placement_groups=lambda args: {"rollout": None},
-                    create_rollout_manager=lambda *args: (manager, None), create_training_models=lambda *args: (actor, None))
-                definitions("train.py", {"train"}, namespace)
-                namespace["train"](args)
-                expected = [stop - 1] if stop > start else []
-                self.assertEqual([value for name, value in events if name == "save"], expected)
-                self.assertEqual([value for name, value in events if name == "cursor"], expected)
-                self.assertEqual([value for name, value in events if name == "train"], list(range(start, stop)))
-                self.assertTrue(all(value % args.eval_interval == 0
-                                    for name, value in events if name == "eval"))
-                if stop == 2 and not start:
-                    position = events.index(("save", 1))
-                    self.assertEqual(events[position - 2:position], [("rollout_offload", None), ("train_onload", None)])
-                status = json.loads((Path(directory) / "training_status.json").read_text())
-                self.assertEqual(status, dict(status="paused", global_step=stop, target_steps=6))
+        namespace = dict(asyncio=asyncio, Namespace=types.SimpleNamespace, Any=Any,
+                         Sample=types.SimpleNamespace, RolloutFnEvalOutput=types.SimpleNamespace,
+                         eval_rollout_single_dataset=dataset_eval)
+        definitions("slime/rollout/sglang_rollout.py", {"eval_rollout"}, namespace)
+        args = types.SimpleNamespace(group_rm=False, eval_datasets=[
+            types.SimpleNamespace(name="a"), types.SimpleNamespace(name="b")])
+        output, auxiliary = asyncio.run(namespace["eval_rollout"](args, 19))
+        self.assertEqual(set(completed), {"a", "b"})
+        self.assertEqual(set(output.data), {"a", "b"})
+        self.assertEqual(auxiliary, [])
 
 
 if __name__ == "__main__":

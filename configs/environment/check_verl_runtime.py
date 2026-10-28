@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=ROOT / "configs/config/qwen3_4b_lightning_opd.yaml")
+    parser.add_argument("--config", type=Path, default=ROOT / "configs/config/qwen3_4b_base_nt_teacher_8b.yaml")
     parser.add_argument("--kernels-only", action="store_true")
     parser.add_argument("--train-smoke", action="store_true", help="Also run one training step and two-row evaluation")
     cli = parser.parse_args()
@@ -34,7 +34,8 @@ def main():
         NVTE_UNFUSED_ATTN=str(int(backend in ("auto", "unfused"))),
     )
     os.environ.update(env)
-    sys.path.insert(0, cfg["megatron_path"])
+    if cfg.get("megatron_path"):
+        sys.path.insert(0, cfg["megatron_path"])
     launcher.check_dependencies(cfg)
 
     for name in (
@@ -98,7 +99,7 @@ def main():
     torch.cuda.empty_cache()
     print("Memory offload/resume passed.", flush=True)
 
-    directory = ROOT / ".runtime/verl/checks" / os.environ.get("SLURM_JOB_ID", str(os.getpid()))
+    directory = ROOT / "tmp/runtime-checks" / os.environ.get("SLURM_JOB_ID", str(os.getpid()))
     directory.mkdir(parents=True, exist_ok=True)
     versions = {
         name: importlib.metadata.version(name)
@@ -109,8 +110,12 @@ def main():
         "attention_backend": cfg["attention_backend"],
         "scope": "kernels" if cli.kernels_only else ("training_and_eval" if cli.train_smoke else "models"),
         "megatron_gpt_sha256": hashlib.sha256(
-            (Path(cfg["megatron_path"]) / "megatron/core/models/gpt/gpt_model.py").read_bytes()
+            Path(importlib.import_module("megatron.core.models.gpt.gpt_model").__file__).read_bytes()
         ).hexdigest(),
+        "module_sources": {
+            name: importlib.import_module(name).__file__
+            for name in ("slime", "megatron.core", "megatron.training", "torch", "ray", "sglang")
+        },
     }
     if not cli.kernels_only:
         # Keep this existing two-sample hardware check independent of the full

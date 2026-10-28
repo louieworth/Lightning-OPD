@@ -103,6 +103,13 @@ class TrainRayActor(RayActor):
         clear_memory()
         print_memory("after TrainRayActor.clear_memory")
 
+    def dispose(self):
+        """Collectively close communication groups before Ray exits workers."""
+        if dist.is_initialized():
+            logger.info("Closing training process groups on rank %s", self._rank)
+            dist.destroy_process_group()
+            logger.info("Training process groups closed on rank %s", self._rank)
+
     @abc.abstractmethod
     def sleep(self, tags):
         raise NotImplementedError

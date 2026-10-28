@@ -49,6 +49,9 @@ class SFTRuntimeTests(unittest.TestCase):
         namespace["check_resume_recipe"](previous, current)
         with self.assertRaisesRegex(ValueError, "learning_rate"):
             namespace["check_resume_recipe"](previous, dict(current, learning_rate=1e-4))
+        relocated = dict(current, python_executable="/new/env/bin/python",
+                         generation_python=None, sft_dependency_archive=None, cuda_home=None)
+        namespace["check_resume_recipe"](previous, relocated)
         old_stage = dict(current, deepspeed_stage=0)
         new_stage = dict(current, deepspeed_stage=2)
         namespace["check_resume_recipe"](old_stage, new_stage, allow_untrained=True)

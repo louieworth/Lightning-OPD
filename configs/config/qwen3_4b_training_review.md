@@ -262,8 +262,7 @@ Lightning 的 actor 使用全部 8 GPU，TP=2、PP=1、CP=1，得到 DP=4。评�
 | `eval_steps` | `--eval-interval` |
 | `policy_rollout_k` | `--lightning-block-config` 与 block plan；block 切换不触发保存 |
 | block 缓存读取 | `--rollout-function-path slime.rollout.lightning_opd_blocks.generate_cached_rollout` |
-| `save_model` | `final` 派生 `--save-final-only` 和 `--save-interval 150` |
-| `walltime_checkpoint_margin_seconds` | sbatch 用 Slurm EndTime 减去 1200 秒，传入 `--checkpoint-deadline` |
+| `save_model` | `active` 配合 `save_eval_multiplier: 1`，保存间隔等于 `eval_steps` |
 | 实验 `eval_metrics/` | `--eval-output-dir`，关闭保存时仍写入评测指标 |
 | 派生 `eval.yaml` | `--eval-config` |
 | 共同启动器 `evaluate()` | `--eval-function-path` |
@@ -400,18 +399,18 @@ num_rollout: 150
 rollout_batch_size: 256
 eval_steps: 25
 rollout_shuffle: false
-save_model: final
-walltime_checkpoint_margin_seconds: 1200
+save_model: active
+save_eval_multiplier: 1
 save_total_limit: 1
 save_retain_interval: null
 async_save: false
 ```
 
-Lightning 和标准 OPD 均使用 `save_model: final`，在第 150 次更新结束时保存完整模型、optimizer、scheduler、RNG 和数据读取位置；若提前到达距 Slurm 时限 20 分钟的保存期限，则完成当前更新后同步保存并退出。block 边界和每 25 步评测不触发 checkpoint。`save_total_limit: 1` 保留最近一个完整 checkpoint，新保存及 rollout cursor 完成后再清理旧文件。
+Lightning 和标准 OPD 均使用 `save_model: active`、`save_eval_multiplier: 1`，每次评测前同步保存完整模型、optimizer、scheduler、RNG 和数据读取位置。保存按全局评测步数执行，与 block 边界无关。`save_total_limit: 1` 在新 checkpoint 保存且评测成功后清理旧 checkpoint 和旧 rollout cursor，保留最新一个完整断点；所有 eval JSON 继续保留。
 
-长评测也受同一保存期限约束：达到期限时取消未完成的评测请求，不写入部分评测结果，释放推理显存并恢复训练 worker，保存最近一个已完成更新及数据游标后退出。若该更新已经保存（包括最终第 150 步），直接保留完整断点。训练前初始评测若耗尽时限，则以 0 步暂停，不生成虚假的训练 checkpoint。
+不再提前 20 分钟保存退出或取消长评测。作业被 Slurm 时限中断后，从最近一次完整 checkpoint 恢复；若 checkpoint 已保存而该步评测尚未完成，resume 会补齐评测。
 
-两种方法仍每 25 步 eval。标准 OPD 另支持 `save_model: active` 配合整数 `save_eval_multiplier` 的定期保存以及 `null` 关闭保存；当前配置使用 `final`。Lightning 启动器保留旧的首块保存模式供没有 `save_model` 的历史配置使用，当前配置已切换到 `final`。
+两种方法共用保存策略。`save_model: active` 按整数 `save_eval_multiplier` 设置评测步数的保存倍数，`final` 只保存最终步，`null` 关闭保存；当前配置在每次评测时保存。最终训练更新也保存并评测。
 
 训练权重同步给 SGLang 后直接在内存中评测，无需从磁盘重新加载或导出 HF。全部 eval JSON 和 W&B 指标继续保留。
 
@@ -524,8 +523,7 @@ sbatch configs/sbatch/qwen3_4b_opd.sbatch
 | `balance_data` | false | true |
 | `apply_chat_template` | false，固定序列已渲染 | true，在线渲染 |
 | `policy_rollout_k` | 1（可配置） | 每次在线 rollout 采样，共 150 次 |
-| 保存模式 | `save_model: final` | `save_model: final` |
-| `walltime_checkpoint_margin_seconds` | 1200 | 1200 |
+| 保存模式 | `save_model: active`，每次 eval 保存 | `save_model: active`，每次 eval 保存 |
 | `save_total_limit` | 1 | 1 |
 | `save_retain_interval` | null | null |
 | 默认实验名 | `qwen3_4b_lightning_opd_base_k1` | `qwen3_4b_opd_base` |
@@ -808,8 +806,8 @@ val_temperature: 0.7
 val_top_p: 0.8
 val_top_k: 20
 save_eval_generations: false
-save_model: final
-walltime_checkpoint_margin_seconds: 1200
+save_model: active
+save_eval_multiplier: 1
 # Resume inside a block uses its saved policy ID and cached teacher logprobs.
 save_total_limit: 1  # null keeps all training checkpoints.
 save_retain_interval: null  # Disable Megatron's separate interval-based pruning.

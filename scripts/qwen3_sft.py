@@ -1,7 +1,6 @@
-"""Cluster SFT stages; all experiment settings come from one flat YAML."""
+"""Cluster SFT stages; experiment settings use YAML and W&B settings use .env."""
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -52,10 +51,12 @@ def setup_env(cfg):
     spec = importlib.util.spec_from_file_location("opd_config", ROOT / "configs/opd/qwen3-4b-opd.py")
     launcher = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(launcher)
-    launcher.load_env(cfg.get("env_file", ".env"))
-    os.environ.update(HF_HOME=cfg["hf_home"], WANDB_MODE=cfg["wandb_mode"],
-                      WANDB_PROJECT=cfg["project_name"], WANDB_ENTITY=cfg["wandb_entity"],
-                      WANDB_DIR=str(run_dir(cfg)), TOKENIZERS_PARALLELISM="false")
+    launcher.load_env(cfg.get("env_file") or ".env")
+    os.environ.update(launcher.wandb_env())
+    os.environ.pop("WANDB_KEY", None)
+    logs = launcher.wandb_directory(cfg, ROOT)
+    logs.mkdir(parents=True, exist_ok=True)
+    os.environ.update(HF_HOME=cfg["hf_home"], WANDB_DIR=str(logs), TOKENIZERS_PARALLELISM="false")
     if cfg.get("local_models_only"):
         os.environ["HF_HUB_OFFLINE"] = "1"
     # One offline run per allocation; separate segments can be synced later.
@@ -99,9 +100,11 @@ def sft_dataset_identity(cfg):
 
 
 def check_resume_recipe(previous, cfg, allow_untrained=False):
-    # Logging and checkpoint schedules do not change the trained model/data.
-    mutable = {"project_name", "wandb_entity", "wandb_mode", "use_wandb", "env_file",
-               "save_strategy", "save_steps", "save_total_limit", "walltime_checkpoint_margin_seconds"}
+    # Logging, dependency locations and checkpoint schedules do not change the
+    # trained model/data. Dependency versions still need to be compatible.
+    mutable = {"project_name", "wandb_entity", "wandb_mode", "wandb_dir", "use_wandb", "env_file",
+               "save_strategy", "save_steps", "save_total_limit", "walltime_checkpoint_margin_seconds",
+               "python_executable", "generation_python", "sft_dependency_archive", "cuda_home"}
     topology_keys = {"nnodes", "n_gpus_per_node"}
     if topology_keys <= previous.keys() and topology_keys <= cfg.keys():
         # ZeRO optimizer and per-rank RNG state depend on the global GPU count,

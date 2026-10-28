@@ -22,28 +22,33 @@ set -euo pipefail
 TASK_REPO_ROOT=/scratch/l/luli/src/Lightning-OPD
 cd "$TASK_REPO_ROOT"
 TASK_CONFIG="${1:-configs/config/qwen3_4b_sft_downloaded.yaml}"
-TASK_BASE_PYTHON=/scratch/l/luli/conda/envs/verl/bin/python
-TASK_BASE_SITE=/scratch/l/luli/conda/envs/verl/lib/python3.12/site-packages
-# Disable the cluster's inherited Python sitecustomize; use this prepared stack.
+TASK_BASE_PYTHON="${LIGHTNING_OPD_PYTHON:-python}"
+# Disable inherited cluster Python paths; use the selected environment.
 unset PYTHONPATH
 export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 SLURM_EXPORT_ENV=ALL
 export PYTHONPYCACHEPREFIX="${SLURM_TMPDIR:-/tmp}/lightning-sft-pycache-${SLURM_JOB_ID}"
-readarray -t TASK_SETTINGS < <(/usr/bin/env PYTHONPATH="$TASK_BASE_SITE" "$TASK_BASE_PYTHON" -S -B -c \
-    'import sys,yaml; c=yaml.safe_load(open(sys.argv[1])); print("\n".join(str(c[k]) for k in ["python_executable","generation_python","cuda_home","nnodes","n_gpus_per_node","master_port","walltime_checkpoint_margin_seconds","sft_dependency_archive"]))' "$TASK_CONFIG")
+TASK_SETTINGS_TEXT="$("$TASK_BASE_PYTHON" -B configs/environment/sft_settings.py "$TASK_CONFIG")"
+readarray -t TASK_SETTINGS <<< "$TASK_SETTINGS_TEXT"
 TASK_SFT_PYTHON="${TASK_SETTINGS[0]}"
 TASK_GENERATION_PYTHON="${TASK_SETTINGS[1]}"
-export CUDA_HOME="${TASK_SETTINGS[2]}"
+if [[ -n "${TASK_SETTINGS[2]}" ]]; then export CUDA_HOME="${TASK_SETTINGS[2]}"; fi
 TASK_NODES="${TASK_SETTINGS[3]}"
 TASK_GPUS="${TASK_SETTINGS[4]}"
 export MASTER_PORT="${TASK_SETTINGS[5]}"
 TASK_MARGIN="${TASK_SETTINGS[6]}"
 TASK_SFT_ARCHIVE="${TASK_SETTINGS[7]}"
 TASK_SFT_DEPENDENCIES="/tmp/lightning-sft-deps-${SLURM_JOB_ID}-${USER}"
-[[ -f "$TASK_SFT_ARCHIVE" ]] || { echo "Missing SFT dependency archive: $TASK_SFT_ARCHIVE" >&2; exit 1; }
+if [[ -n "$TASK_SFT_ARCHIVE" && ! -f "$TASK_SFT_ARCHIVE" ]]; then
+    echo "Missing SFT dependency archive: $TASK_SFT_ARCHIVE" >&2
+    exit 1
+fi
 [[ "$SLURM_JOB_NUM_NODES" == "$TASK_NODES" ]] || { echo "Allocation/YAML node count mismatch" >&2; exit 1; }
-export PATH="$(dirname "$TASK_SFT_PYTHON"):$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="/scratch/l/luli/conda/envs/verl/lib/python3.12/site-packages/nvidia/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export HF_HOME=/scratch/l/luli/hf
+export PATH="$(dirname "$TASK_SFT_PYTHON")${CUDA_HOME:+:$CUDA_HOME/bin}:$PATH"
+TASK_CUDA_RUNTIME="$("$TASK_SFT_PYTHON" -B -c 'import sysconfig; print(sysconfig.get_paths()["purelib"] + "/nvidia/cuda_runtime/lib")')"
+if [[ -d "$TASK_CUDA_RUNTIME" ]]; then
+    export LD_LIBRARY_PATH="$TASK_CUDA_RUNTIME${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+export HF_HOME="${TASK_SETTINGS[8]}"
 export VLLM_NO_USAGE_STATS=1 VLLM_DO_NOT_TRACK=1
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 export TORCH_EXTENSIONS_DIR="${SLURM_TMPDIR:-/tmp}/lightning-sft-extensions-${SLURM_JOB_ID}"
@@ -59,15 +64,18 @@ run_stage() {
         --cpu-bind=none --gpu-bind=none --kill-on-bad-exit=1 --unbuffered "${@:2}"
 }
 echo "[1/2] Verify prepared dataset provenance and configure direct SFT"
-# Configuration only needs Arrow/YAML; skip inherited .pth hooks that import torch.
-run_stage 1 /usr/bin/env PYTHONPATH="$TASK_BASE_SITE" "$TASK_GENERATION_PYTHON" -S -B \
+run_stage 1 "$TASK_GENERATION_PYTHON" -B \
     scripts/qwen3_sft.py --config "$TASK_CONFIG" --stage configure
 echo "[2/2] Direct LlamaFactory SFT: 3000 steps, global batch 256; ZeRO stage from YAML"
 # Static rendezvous: all nodes share MASTER_ADDR/PORT; Slurm supplies node rank.
 run_stage "$TASK_NODES" /bin/bash -c '
-    mkdir -p "$5"
-    tar -xzf "$6" -C "$5"
-    export PYTHONPATH="$5:$PWD"
+    set -euo pipefail
+    if [[ -n "$6" ]]; then
+        mkdir -p "$5"
+        tar -xzf "$6" -C "$5"
+        export PYTHONPATH="$5${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+    export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
     exec "$1" -B -m torch.distributed.run --nnodes="$3" --nproc-per-node="$4" \
         --node-rank="$SLURM_PROCID" --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
         scripts/qwen3_sft.py --config "$2" --stage train
