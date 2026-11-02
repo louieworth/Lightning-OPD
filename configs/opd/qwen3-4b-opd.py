@@ -56,6 +56,7 @@ LAUNCHER_KEYS = {
     "conversion_num_gpus",
     "nnodes",
     "n_gpus_per_node",
+    "ray_cluster",
     "startup_timeout",
     "teacher_num_gpus",
     "teacher_tp_size",
@@ -98,6 +99,9 @@ def read_config(path, method, resume=False):
     if not isinstance(cfg, dict) or cfg.get("method") != method:
         raise ValueError(f"{path}: expected method: {method}")
     cfg = normalize_epochs(cfg)
+    cfg.setdefault("ray_cluster", "managed")
+    if cfg["ray_cluster"] not in ("managed", "existing"):
+        raise ValueError("ray_cluster must be managed (the launcher starts Ray) or existing (a pre-started cluster).")
     # A full Megatron installation may already be provided by the active
     # environment. An explicit source checkout is an optional override.
     megatron = cfg.get("megatron_path") or os.environ.get("MEGATRON_PATH")
@@ -612,8 +616,10 @@ def model_args(cfg, env):
 
 
 def checkpoint_path(cfg, student):
+    """The student's initial Megatron checkpoint, converted once and shared by every experiment
+    in output_dir that starts from the same student (it is only read: ref_load / initial load)."""
     key = hashlib.sha256(student.encode()).hexdigest()[:12]
-    return run_dir(cfg) / "models" / key / "torch_dist"
+    return Path(cfg["output_dir"]).expanduser().resolve() / "converted_models" / key / "torch_dist"
 
 
 def training_args(cfg, student, teacher_url, eval_path=None):
@@ -1098,7 +1104,148 @@ def preflight(cfg, student, teacher):
     print(f"Preflight passed on node {node_index + 1}/{len(hosts)} ({hosts[node_index]}).", flush=True)
 
 
+def prepare_head(cfg, student, teacher, env, conversion_env):
+    """Before training starts: validate the run, record its models and convert the initial checkpoint."""
+    check_inputs(cfg)
+    check_run_state(cfg, student, teacher)
+    initialization = run_dir(cfg) / "initialization.json"
+    initialization.write_text(json.dumps({"student": student, "teacher": teacher}, indent=2))
+    checkpoint = checkpoint_path(cfg, student)
+    if not (checkpoint / "latest_checkpointed_iteration.txt").is_file():
+        if not cfg["auto_prepare_model"]:
+            raise FileNotFoundError(f"Converted checkpoint missing: {checkpoint}; enable auto_prepare_model.")
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc-per-node",
+                str(cfg["conversion_num_gpus"]),
+                "tools/convert_hf_to_torch_dist.py",
+                *model_args(cfg, env),
+                "--attention-backend",
+                cfg["attention_backend"],
+                "--hf-checkpoint",
+                student,
+                "--save",
+                str(checkpoint),
+            ],
+            check=True,
+            cwd=ROOT,
+            env=conversion_env,
+        )
+
+
+def run_training(cfg, student, teacher, env, teacher_url):
+    """With Ray (and any teacher) up: prepare block prompts, run train.py, verify and prune its outputs."""
+    directory = run_dir(cfg)
+    if teacher_url:
+        wait_ready(teacher_url.rsplit("/", 1)[0] + "/health_generate", cfg["startup_timeout"])
+    if lightning_blocks.enabled(cfg):
+        lightning_blocks.prepare_fixed_prompts(cfg, student)
+    elif cfg["method"] == "lightning_opd" and lightning_data(cfg).with_suffix(".manifest.json").exists():
+        actual = json.loads(lightning_data(cfg).with_suffix(".manifest.json").read_text())
+        if actual != scored_provenance(cfg, student, teacher):
+            raise ValueError("Precomputed data provenance differs from this student/teacher/sampling configuration.")
+    (directory / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    command = [
+        sys.executable,
+        "train.py",
+        *model_args(cfg, env),
+        *training_args(cfg, student, teacher_url, prepare_eval(cfg)),
+    ]
+    print("Training command:", shlex.join(command), flush=True)
+    subprocess.run(command, check=True, cwd=ROOT, env=env)
+    if cfg.get("save_interval") is not None:
+        tracker = directory / "checkpoints/latest_checkpointed_iteration.txt"
+        expected = cfg["num_rollout"] - 1
+        if not tracker.is_file() or int(tracker.read_text().strip()) != expected:
+            raise RuntimeError("Training exited without its required completed checkpoint.")
+    if cfg.get("eval_steps"):
+        final_metrics = directory / "eval_metrics" / f"{cfg['num_rollout'] - 1}.json"
+        if not final_metrics.is_file():
+            raise FileNotFoundError(f"Training exited without final evaluation metrics: {final_metrics}")
+        print(f"Training and final evaluation completed: {final_metrics}", flush=True)
+    if cfg.get("save_interval") is not None:
+        prune_training_checkpoints(directory / "checkpoints", cfg.get("save_total_limit"), require_rollout_state=True)
+
+
+# Top-level repository entries that are run state or environments, not code to mirror between nodes.
+REPOSITORY_STATE = {"outputs", "data", "wandb", "tmp", "checkpoints", ".venv", ".runtime", ".env"}
+
+
+def train_existing_cluster(cfg, student, teacher, env):
+    """Pre-started Ray cluster without a shared filesystem.
+
+    Ray is neither started nor stopped, and Ray workers run this launcher's interpreter with its
+    environment. Run files live on this node: the rollout manager runs here (and every GPU bundle
+    too for a one-node job), and the converted initial checkpoint is mirrored to the other nodes.
+    """
+    import ray
+    from slime.utils import ray_job
+
+    check_training_storage(cfg, student)
+    run_dir(cfg).mkdir(parents=True, exist_ok=True)
+    ray.init(address=env.get("RAY_ADDRESS", "auto"), logging_level="ERROR", log_to_driver=False)
+    try:
+        node = ray.util.get_node_ip_address()
+        here = ray.get_runtime_context().get_node_id()
+        free = ray._private.state.available_resources_per_node()
+        others = [n["NodeID"] for n in ray.nodes() if n["Alive"] and n["NodeID"] != here
+                  and n["Resources"].get("GPU", 0) >= cfg["n_gpus_per_node"]]
+        nodes = [here] + others[:cfg["nnodes"] - 1]
+        short = [n for n in nodes if free.get(n, {}).get("GPU", 0) < cfg["n_gpus_per_node"]]
+        if len(nodes) < cfg["nnodes"] or short:
+            raise RuntimeError(f"The job needs {cfg['n_gpus_per_node']} free GPUs on each of {cfg['nnodes']} nodes; "
+                               f"nodes without them: {short or 'too few GPU nodes'}.")
+        if cfg["nnodes"] > 1 and ray_job.missing_on_nodes(student):
+            raise FileNotFoundError(f"The student {student} is missing on {ray_job.missing_on_nodes(student)}; "
+                                    "copy it to the same path on every node.")
+        host = node.strip("[]")
+        # Every node bypasses the proxy: the router here health-checks engines on the other nodes.
+        # Bare IPv6 only: httpx brackets it itself, but turns "[addr]" into an invalid URL pattern.
+        cluster = [n["NodeManagerAddress"].strip("[]") for n in ray.nodes() if n["Alive"]]
+        # SGLang servers bind 0.0.0.0 and send their startup warmup request to that address.
+        local = [value for value in ("127.0.0.1", "localhost", "::1", "0.0.0.0", host, *cluster) if value]
+        no_proxy = ",".join(dict.fromkeys(local + [x for x in env.get("no_proxy", "").split(",") if x]))
+        env = dict(env, no_proxy=no_proxy, NO_PROXY=no_proxy, MASTER_ADDR=host,
+                   RAY_ADDRESS=env.get("RAY_ADDRESS", "auto"))
+        if cfg["nnodes"] > 1:  # Every node must run this exact code; run outputs and data stay here.
+            ray_job.mirror(ROOT, exclude=REPOSITORY_STATE)
+        prepare_head(cfg, student, teacher, env, env)
+        if cfg["nnodes"] > 1:
+            ray_job.mirror(checkpoint_path(cfg, student))
+        public, secret = ray_job.split_secrets(env)
+        workers = {key: value for key, value in public.items()
+                   if key != "CUDA_VISIBLE_DEVICES" and not key.startswith("RAY_")}
+        secrets_path = Path.home() / ".cache/lightning_opd/worker_secrets.json"
+        ray_job.write_worker_secrets(secret, secrets_path)
+        workers[ray_job.SECRETS_ENV] = str(secrets_path)
+        env[ray_job.NODE_ENV] = node
+        if cfg["nnodes"] == 1:
+            env[ray_job.SINGLE_NODE_ENV] = "1"
+        env[ray_job.RUNTIME_ENV] = json.dumps({"py_executable": sys.executable, "env_vars": workers,
+                                              "worker_process_setup_hook": "slime.utils.ray_job.load_worker_secrets"})
+        with contextlib.ExitStack() as stack:
+            teacher_url = cfg.get("teacher_url")
+            if cfg["method"] == "opd" and not teacher_url:
+                # The live teacher holds its GPUs through Ray on this node; only the rollout manager
+                # (also on this node) queries it, so loopback is enough.
+                stack.enter_context(ray_job.gpu_process(
+                    server_command(cfg, teacher, cfg["teacher_port"], cfg["teacher_tp_size"],
+                                   cfg["teacher_mem_fraction_static"], True),
+                    env, cfg["teacher_num_gpus"], {f"node:{node}": 0.001}, run_dir(cfg) / "teacher.log"))
+                teacher_url = f"http://127.0.0.1:{cfg['teacher_port']}/generate"
+            run_training(cfg, student, teacher, env, teacher_url)
+    finally:
+        ray.shutdown()
+
+
 def train_cluster(cfg, student, teacher, env):
+    if cfg.get("ray_cluster") == "existing":
+        return train_existing_cluster(cfg, student, teacher, env)
     hosts, node_index = cluster_nodes(cfg)
     check_training_storage(cfg, student)
     directory = run_dir(cfg)
@@ -1161,39 +1308,7 @@ def train_cluster(cfg, student, teacher, env):
             ]
             if node_index == 0:
                 done.unlink(missing_ok=True)
-                check_inputs(cfg)
-                check_run_state(cfg, student, teacher)
-                initialization = directory / "initialization.json"
-                identity = {"student": student, "teacher": teacher}
-                initialization.write_text(json.dumps(identity, indent=2))
-                checkpoint = checkpoint_path(cfg, student)
-                if not (checkpoint / "latest_checkpointed_iteration.txt").is_file():
-                    if not cfg["auto_prepare_model"]:
-                        raise FileNotFoundError(
-                            f"Converted checkpoint missing: {checkpoint}; enable auto_prepare_model."
-                        )
-                    checkpoint.parent.mkdir(parents=True, exist_ok=True)
-                    subprocess.run(
-                        [
-                            sys.executable,
-                            "-m",
-                            "torch.distributed.run",
-                            "--standalone",
-                            "--nproc-per-node",
-                            str(cfg["conversion_num_gpus"]),
-                            "tools/convert_hf_to_torch_dist.py",
-                            *model_args(cfg, env),
-                            "--attention-backend",
-                            cfg["attention_backend"],
-                            "--hf-checkpoint",
-                            student,
-                            "--save",
-                            str(checkpoint),
-                        ],
-                        check=True,
-                        cwd=ROOT,
-                        env=ray_env,
-                    )
+                prepare_head(cfg, student, teacher, env, ray_env)
                 ray_command += [
                     "--head",
                     "--port",
@@ -1232,40 +1347,7 @@ def train_cluster(cfg, student, teacher, env):
                     raise TimeoutError(f"Ray did not register {expected} GPUs.")
                 time.sleep(2)
             ray.shutdown()
-            if teacher_url:
-                wait_ready(teacher_url.rsplit("/", 1)[0] + "/health_generate", cfg["startup_timeout"])
-            if lightning_blocks.enabled(cfg):
-                lightning_blocks.prepare_fixed_prompts(cfg, student)
-            elif cfg["method"] == "lightning_opd" and lightning_data(cfg).with_suffix(".manifest.json").exists():
-                actual = json.loads(lightning_data(cfg).with_suffix(".manifest.json").read_text())
-                if actual != scored_provenance(cfg, student, teacher):
-                    raise ValueError(
-                        "Precomputed data provenance differs from this student/teacher/sampling configuration."
-                    )
-            (directory / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
-            command = [
-                sys.executable,
-                "train.py",
-                *model_args(cfg, env),
-                *training_args(cfg, student, teacher_url, prepare_eval(cfg)),
-            ]
-            print("Training command:", shlex.join(command), flush=True)
-            subprocess.run(command, check=True, cwd=ROOT, env=env)
-            if cfg.get("save_interval") is not None:
-                tracker = directory / "checkpoints/latest_checkpointed_iteration.txt"
-                expected = cfg["num_rollout"] - 1
-                if not tracker.is_file() or int(tracker.read_text().strip()) != expected:
-                    raise RuntimeError("Training exited without its required completed checkpoint.")
-            if cfg.get("eval_steps"):
-                final_metrics = directory / "eval_metrics" / f"{cfg['num_rollout'] - 1}.json"
-                if not final_metrics.is_file():
-                    raise FileNotFoundError(f"Training exited without final evaluation metrics: {final_metrics}")
-                print(f"Training and final evaluation completed: {final_metrics}", flush=True)
-            if cfg.get("save_interval") is not None:
-                prune_training_checkpoints(
-                    directory / "checkpoints", cfg.get("save_total_limit"),
-                    require_rollout_state=True,
-                )
+            run_training(cfg, student, teacher, env, teacher_url)
         if node_index == 0:
             done.write_text("success")
     except BaseException:

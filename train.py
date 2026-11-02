@@ -20,6 +20,9 @@ def train(args):
     from pathlib import Path
 
     configure_logger()
+    from slime.utils import ray_job
+
+    ray_job.connect()  # Pre-started cluster: start this job with the launcher's runtime env.
     # allocate the GPUs
     pgs = create_placement_groups(args)
     init_tracking(args)

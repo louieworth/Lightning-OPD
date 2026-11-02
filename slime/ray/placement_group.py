@@ -7,6 +7,8 @@ import ray
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from slime.utils import ray_job
+
 from .actor_group import RayTrainGroup
 from .rollout import RolloutManager
 
@@ -42,7 +44,7 @@ def sort_key(x):
 
 def _create_placement_group(num_gpus):
     """Create a placement group with the specified number of GPUs."""
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
+    bundles = ray_job.gpu_bundles(num_gpus)
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
@@ -166,6 +168,7 @@ def create_rollout_manager(args, pg):
     rollout_manager = RolloutManager.options(
         num_cpus=1,
         num_gpus=0,
+        resources=ray_job.node_resources(),
     ).remote(args, pg)
 
     # calculate num_rollout from num_epoch
