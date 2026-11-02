@@ -12,20 +12,13 @@ import torch
 import torch.distributed as dist
 
 from slime.ray.ray_actor import RayActor
+from slime.ray.utils import get_local_gpu_id
 from slime.utils.checkpoint_globals import register_checkpoint_safe_globals
 from slime.utils.distributed_utils import init_gloo_group
 from slime.utils.logging_utils import configure_logger
 from slime.utils.memory_utils import clear_memory, print_memory
 
 logger = logging.getLogger(__name__)
-
-
-def get_local_gpu_id():
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cvd is None:
-        return ray.get_gpu_ids()[0]
-    else:
-        return cvd.split(",").index(str(ray.get_gpu_ids()[0]))
 
 
 class TrainRayActor(RayActor):

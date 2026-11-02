@@ -32,6 +32,14 @@ def ray_noset_visible_devices(env_vars=os.environ):
     return any(env_vars.get(env_var) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)
 
 
+def get_local_gpu_id():
+    """Index, among the devices this process sees, of the GPU Ray assigned to its placement-group bundle."""
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cvd is None:
+        return int(ray.get_gpu_ids()[0])
+    return cvd.split(",").index(str(ray.get_gpu_ids()[0]))
+
+
 def get_physical_gpu_id():
     device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)

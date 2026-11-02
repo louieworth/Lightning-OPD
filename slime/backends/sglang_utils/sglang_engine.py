@@ -14,22 +14,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 
 from slime.ray.ray_actor import RayActor
+from slime.ray.utils import get_local_gpu_id
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
-
-
-def get_base_gpu_id(args, rank):
-    num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
-    if args.colocate:
-        start_index = (rank * num_gpus) % args.num_gpus_per_node
-    else:
-        num_actor_gpus = 0 if args.debug_rollout_only else args.actor_num_gpus_per_node * args.actor_num_nodes
-        start_index = (num_actor_gpus + rank * num_gpus) % args.num_gpus_per_node
-        if args.use_critic:
-            num_critic_gpus = args.critic_num_gpus_per_node * args.critic_num_nodes
-            start_index = (num_actor_gpus + num_critic_gpus + rank * num_gpus) % args.num_gpus_per_node
-    return start_index
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
@@ -453,7 +441,9 @@ def _compute_server_args(
         "node_rank": node_rank,
         "dist_init_addr": dist_init_addr,
         "gpu_id_step": 1,
-        "base_gpu_id": get_base_gpu_id(args, rank),
+        # The engine actor sits in the first bundle of its GPUs; Ray knows which GPU that bundle got, even
+        # when other jobs or the teacher hold GPUs before it on the node.
+        "base_gpu_id": get_local_gpu_id(),
         # parallel
         "tp_size": args.rollout_num_gpus_per_engine,
         "dp_size": args.sglang_dp_size,
