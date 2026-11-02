@@ -17,6 +17,7 @@ from slime.utils.checkpoint_globals import register_checkpoint_safe_globals
 from slime.utils.distributed_utils import init_gloo_group
 from slime.utils.logging_utils import configure_logger
 from slime.utils.memory_utils import clear_memory, print_memory
+from slime.utils.tracking_utils import finish_tracking
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class TrainRayActor(RayActor):
             logger.info("Closing training process groups on rank %s", self._rank)
             dist.destroy_process_group()
             logger.info("Training process groups closed on rank %s", self._rank)
+        finish_tracking()
 
     @abc.abstractmethod
     def sleep(self, tags):

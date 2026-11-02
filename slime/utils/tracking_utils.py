@@ -15,6 +15,12 @@ def init_tracking(args, primary: bool = True, **kwargs):
         wandb_utils.init_wandb_secondary(args, **kwargs)
 
 
+def finish_tracking():
+    """Upload this process's remaining W&B records before Ray stops it; secondaries leave the run state alone."""
+    if wandb.run is not None:
+        wandb.finish()
+
+
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
     if args.use_wandb:

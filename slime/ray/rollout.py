@@ -93,6 +93,7 @@ class RolloutManager:
             grading = sys.modules.get("slime.eval.reward_async")
             if grading is not None:
                 grading.shutdown()
+            tracking_utils.finish_tracking()  # The final evaluation was logged seconds ago.
 
     # TODO maybe rename "rollout_engines" and "all_rollout_engines" later
     @property
