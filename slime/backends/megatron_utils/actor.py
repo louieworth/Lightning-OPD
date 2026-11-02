@@ -142,9 +142,10 @@ class MegatronTrainRayActor(TrainRayActor):
         # empty cache after initialization
         clear_memory()
 
+        # Recover the actor in the end: loading the reference model overwrote the parameters, and the
+        # non-colocated weight updater pushes the parameters themselves to the rollout engines.
+        self._switch_model("actor")
         if self.args.offload_train:
-            # recover to actor in the end.
-            self._switch_model("actor")
             self.sleep()
 
         self.rollout_engines = None
