@@ -95,6 +95,14 @@ class BlockTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "block plan changed"):
             blocks.prepare_fixed_prompts(dict(self.cfg, policy_rollout_k=3), "student", Tokenizer())
 
+    def test_engines_get_new_weights_only_before_they_are_used(self):
+        """Within a block the engines idle until an evaluation or the next block's generation."""
+        plan = blocks.schedule(dict(self.cfg, num_rollout=6, policy_rollout_k=2))  # steps [0, 3) and [3, 6)
+        needed = [blocks.engines_needed_after(plan, step, evaluating=False) for step in range(6)]
+        self.assertEqual(needed, [False, False, True, False, False, False])  # before step 3's block generation
+        self.assertTrue(blocks.engines_needed_after(plan, 0, evaluating=True))
+        self.assertTrue(blocks.engines_needed_after(plan, 5, evaluating=True))  # final evaluation
+
     def test_fixed_sequence_keeps_source_order_on_every_pass(self):
         rows = pq.read_table(blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())).to_pylist()
         self.assertEqual([row["prompt"] for row in rows], ["one", "two", "three"] * 4)
@@ -631,7 +639,8 @@ class BlockTests(unittest.TestCase):
                         eval=Remote(lambda index, completed_steps: event("eval", completed_steps)),
                         save=Remote(lambda index: event("cursor", index)), dispose=Remote(lambda: event("dispose")),
                     )
-                    coordinator = types.SimpleNamespace(ensure_block=lambda index: None)
+                    coordinator = types.SimpleNamespace(ensure_block=lambda index: None, blocks=blocks.schedule(
+                        dict(num_rollout=6, rollout_batch_size=2, policy_rollout_k=1)))
                     ray = types.SimpleNamespace(get=lambda value: value)
                     namespace = dict(ray=ray, GPU_MEMORY_TYPE_WEIGHTS="weights", GPU_MEMORY_TYPE_KV_CACHE="kv",
                                      GPU_MEMORY_TYPE_CUDA_GRAPH=None, configure_logger=lambda: None,
@@ -654,6 +663,54 @@ class BlockTests(unittest.TestCase):
                     self.assertLess(events.index(("dispose_train", None)), events.index(("dispose", None)))
                     status = json.loads((self.run / "training_status.json").read_text())
                     self.assertEqual(status, dict(status="complete", global_step=6, target_steps=6))
+
+    def test_block_engines_get_weights_only_for_evaluation_or_generation(self):
+        """Offloaded training (the real setting): weights reach the engines at startup, before each
+        evaluation and before the next block's generation; never after an update nothing will use."""
+        function = next(item for item in ast.parse((ROOT / "train.py").read_text()).body
+                        if isinstance(item, ast.FunctionDef) and item.name == "train")
+        events = []
+        args = types.SimpleNamespace(
+            num_rollout=6, start_rollout_id=0, eval_interval=3, eval_on_resume=False, offload_train=True,
+            offload_rollout=True, enable_weights_backuper=True, use_critic=False, rollout_global_dataset=False,
+            rollout_batch_size=2, save_interval=None, save_final_only=False, update_weights_interval=1,
+            save=None, lightning_block_config="unused",
+        )
+        actor = types.SimpleNamespace(
+            async_train=lambda i, data: events.append(("train", i)), offload=lambda: events.append(("actor_sleep", None)),
+            onload=lambda: events.append(("actor_wake", None)), update_weights=lambda: events.append(("push", None)),
+            clear_memory=lambda: None, dispose=lambda: None)
+        manager = types.SimpleNamespace(
+            generate=Remote(lambda index: None), save=Remote(lambda index: None), dispose=Remote(lambda: None),
+            eval=Remote(lambda index, completed_steps: events.append(("eval", completed_steps))),
+            offload=Remote(lambda: events.append(("engines_off", None))),
+            onload=Remote(lambda tags=None: events.append(("engines_on", tags))))
+        coordinator = types.SimpleNamespace(ensure_block=lambda index: events.append(("ensure_block", index)),
+                                            blocks=blocks.schedule(dict(num_rollout=6, rollout_batch_size=2, policy_rollout_k=2)))
+        namespace = dict(ray=types.SimpleNamespace(get=lambda value: value), GPU_MEMORY_TYPE_WEIGHTS="weights",
+                         GPU_MEMORY_TYPE_KV_CACHE="kv", GPU_MEMORY_TYPE_CUDA_GRAPH="graph", configure_logger=lambda: None,
+                         init_tracking=lambda args: None, create_placement_groups=lambda args: {"rollout": None},
+                         create_rollout_manager=lambda *args: (manager, 6),
+                         create_training_models=lambda *args: (actor, None))
+        with patch.object(blocks, "BlockCoordinator", return_value=coordinator), \
+                patch.object(Path, "write_text"), patch.object(Path, "replace"):
+            exec(compile(ast.Module(body=[function], type_ignores=[]), "train.py", "exec"), namespace)
+            namespace["train"](args)
+        names = [name for name, _ in events]
+        trained_before_push = [names[:i].count("train") for i, name in enumerate(names) if name == "push"]
+        self.assertEqual(trained_before_push, [0, 3, 6])  # startup, then after steps 2 and 5 (blocks [0, 3), [3, 6))
+        self.assertEqual([value for name, value in events if name == "eval"], [3, 6])
+        for i, name in enumerate(names):
+            if name == "eval":
+                self.assertGreater(max(j for j in range(i) if names[j] == "push"), max(j for j in range(i) if names[j] == "train"))
+        engine_states = [name for name in names if name in ("engines_off", "engines_on")]
+        self.assertNotIn(("engines_off", "engines_off"), list(zip(engine_states, engine_states[1:])))
+        # The actor stays on the GPUs (and keeps its NCCL groups) between those refreshes: it sleeps
+        # only to hand the GPUs to the engines, right before each weight push.
+        sleeps = [i for i, name in enumerate(names) if name == "actor_sleep"]
+        pushes = [i for i, name in enumerate(names) if name == "push"][1:]  # after the startup push
+        self.assertEqual(len(sleeps), len(pushes))
+        self.assertTrue(all(sleep < push and "train" not in names[sleep:push] for sleep, push in zip(sleeps, pushes)))
 
     def test_fixed_sampler_checks_absolute_batch_positions(self):
         rows = [types.SimpleNamespace(metadata=dict(lightning_sample_index=i, policy_block_index=1)) for i in (6, 7)]

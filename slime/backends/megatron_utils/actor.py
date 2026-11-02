@@ -55,6 +55,9 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
     ) -> int | None:
         monkey_patch_torch_dist()
+        # Whether the model is offloaded; sleep()/wake_up() act only on real transitions, so the
+        # actor can stay on the GPUs (and keep its NCCL groups) between updates.
+        self._asleep = False
 
         super().init(args, role, with_ref)
 
@@ -167,6 +170,8 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        if self._asleep:
+            return
 
         from .opd import clear_teacher_head_cache
         clear_teacher_head_cache()
@@ -176,15 +181,19 @@ class MegatronTrainRayActor(TrainRayActor):
         destroy_process_groups()
 
         torch_memory_saver.pause()
+        self._asleep = True
 
         print_memory("after offload model")
 
     @timer
     def wake_up(self) -> None:
         assert self.args.offload_train
+        if not self._asleep:
+            return
         print_memory("before wake_up model")
 
         torch_memory_saver.resume()
+        self._asleep = False
 
         clear_memory()
         reload_process_groups()
@@ -477,8 +486,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_rollout_only:
             return
 
-        # torch dist may trigger nccl communication during saving.
-        if self.args.offload_train:
+        # torch dist may trigger nccl communication during saving. An asleep actor needs its groups
+        # back for the save and tears them down again; an awake one keeps them.
+        if self.args.offload_train and self._asleep:
             reload_process_groups()
 
         if self.args.async_save:
@@ -491,7 +501,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
 
-        if self.args.offload_train:
+        if self.args.offload_train and self._asleep:
             destroy_process_groups()
 
     @timer
@@ -499,7 +509,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
-        if self.args.offload_train:
+        if self.args.offload_train and self._asleep:
             reload_process_groups()
 
         rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
@@ -533,7 +543,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     self.weights_backuper.backup("old_actor")
 
-        if self.args.offload_train:
+        if self.args.offload_train and self._asleep:
             destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:

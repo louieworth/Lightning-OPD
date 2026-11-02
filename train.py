@@ -94,9 +94,12 @@ def train(args):
 
     block_coordinator = None
     if getattr(args, "lightning_block_config", None):
-        from slime.rollout.lightning_opd_blocks import BlockCoordinator
+        from slime.rollout import lightning_opd_blocks
 
-        block_coordinator = BlockCoordinator(args, rollout_manager)
+        block_coordinator = lightning_opd_blocks.BlockCoordinator(args, rollout_manager)
+
+    # Block Lightning keeps the engines offloaded between updates that no evaluation or generation needs.
+    engines_offloaded = False
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
@@ -110,7 +113,7 @@ def train(args):
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
-        if args.offload_rollout:
+        if args.offload_rollout and not engines_offloaded:
             ray.get(rollout_manager.offload.remote())
 
         if args.use_critic:
@@ -139,8 +142,16 @@ def train(args):
         # When lag > 1, the rollout engine runs with stale weights; IS correction
         # (--use-rollout-logprobs + --use-tis) handles the resulting distribution shift.
         should_sync = (rollout_id - args.start_rollout_id + 1) % args.update_weights_interval == 0
+        evaluating = args.eval_interval is not None and (
+            completed_steps % args.eval_interval == 0 or epoch_end or final_step
+        )
+        engines_needed = block_coordinator is None or lightning_opd_blocks.engines_needed_after(
+            block_coordinator.blocks, rollout_id, evaluating
+        )
 
-        if args.enable_weights_backuper:
+        if not engines_needed:
+            pass  # Block Lightning: the actor stays on the GPUs (and keeps its NCCL groups); engines stay offloaded.
+        elif args.enable_weights_backuper:
             offload_train()
             onload_rollout()
             if should_sync:
@@ -152,14 +163,13 @@ def train(args):
                 actor_model.update_weights()
             offload_train()
 
-        if args.offload_rollout:
+        if args.offload_rollout and engines_needed:
             if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
                 ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH]))
             ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE]))
+        engines_offloaded = args.offload_rollout and not engines_needed
 
-        if args.eval_interval is not None and (
-            completed_steps % args.eval_interval == 0 or epoch_end or final_step
-        ):
+        if evaluating:
             evaluate(rollout_id, completed_steps)
 
     actor_model.dispose()

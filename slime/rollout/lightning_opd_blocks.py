@@ -59,6 +59,15 @@ def schedule(cfg):
     return blocks
 
 
+def engines_needed_after(blocks, rollout_id, evaluating):
+    """Whether the inference engines need the weights trained in step `rollout_id`.
+
+    Within a block they serve nothing but an evaluation or the next block's generation, so pushing
+    weights to them (and swapping their memory back in) after every update is pure overhead.
+    """
+    return evaluating or any(block["start_step"] == rollout_id + 1 for block in blocks)
+
+
 def fixed_data(cfg):
     path = cfg.get("lightning_fixed_data")
     if path:
