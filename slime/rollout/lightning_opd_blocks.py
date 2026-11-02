@@ -19,6 +19,28 @@ import uuid
 from slime.utils.opd_config import needs_teacher_features
 
 
+ROW_GROUP = 1024  # Parquet row group size and progress-report granularity.
+
+
+def ordered_groups(function, rows, concurrency):
+    """Apply `function` to every row with up to `concurrency` calls in flight; yield results in row order,
+    ROW_GROUP at a time. A finished call frees its slot for the next row at once, so no row group waits
+    for its slowest row (block generation is long-tailed). Queued calls are cancelled on failure.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+    try:
+        group = []
+        for result in pool.map(function, rows):
+            group.append(result)
+            if len(group) == ROW_GROUP:
+                yield group
+                group = []
+        if group:
+            yield group
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def enabled(cfg):
     return cfg.get("method") == "lightning_opd" and "policy_rollout_k" in cfg
 
@@ -211,6 +233,11 @@ def boundary_policy_id(args, cfg, models, index, rollout_id, new_policy_id):
     return new_policy_id
 
 
+def identity_metadata(identity):
+    """Parquet schema metadata naming the block's student, teacher, policy and sampling recipe."""
+    return {b"lightning_identity": json.dumps(identity, sort_keys=True).encode()}
+
+
 def write_batches(path, batches, identity, expected_rows):
     """Commit bounded row groups; a failed request never publishes partial data."""
     import pyarrow as pa
@@ -223,7 +250,8 @@ def write_batches(path, batches, identity, expected_rows):
         for rows in batches:
             table = pa.Table.from_pylist(rows)
             if writer is None:
-                writer = pq.ParquetWriter(temporary, table.schema, compression="zstd")
+                writer = pq.ParquetWriter(temporary, table.schema.with_metadata(identity_metadata(identity)),
+                                          compression="zstd")
             writer.write_table(table)
             count += len(rows)
             print(f"{path.parent.name}/{path.name}: {count:,}/{expected_rows:,}", flush=True)
@@ -234,6 +262,27 @@ def write_batches(path, batches, identity, expected_rows):
             writer.close()
     temporary.replace(path)
     atomic_json(path.with_suffix(".manifest.json"), identity)
+
+
+def shared_rollouts(cfg, identity):
+    """Initial-policy student rollouts depend on the student, prompts and sampling, not on the teacher:
+    experiments that differ only in their teacher share one copy under <output_dir>/rollout_cache."""
+    student_identity = {key: value for key, value in identity.items() if key != "teacher"}
+    path = Path(cfg["output_dir"]) / "rollout_cache" / digest(student_identity)[:16] / "student_rollouts.parquet"
+    return path, student_identity
+
+
+def copy_block(source, target, identity):
+    """Copy a block file, recording `identity` (its new owner's student/teacher) in data and manifest."""
+    import pyarrow.parquet as pq
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp.parquet")
+    table = pq.read_table(source)
+    pq.write_table(table.replace_schema_metadata(identity_metadata(identity)), temporary, compression="zstd",
+                   row_group_size=ROW_GROUP)
+    temporary.replace(target)
+    atomic_json(target.with_suffix(".manifest.json"), identity)
 
 
 def prepare_student_block(manager, index, policy_id):
@@ -248,6 +297,11 @@ def prepare_student_block(manager, index, policy_id):
     identity = block_identity(cfg, models, index, policy_id)
     rollouts, scored = block_paths(cfg, index)
     if cached(scored, teacher_identity(cfg, identity), count) or cached(rollouts, identity, count):
+        return
+    shared, shared_identity = shared_rollouts(cfg, identity) if policy_id == "initial" else (None, None)
+    if shared is not None and cached(shared, shared_identity, count):
+        copy_block(shared, rollouts, identity)
+        print(f"Policy rollout {index + 1}: reusing the initial student's responses from {shared.parent}.", flush=True)
         return
     if not hasattr(manager, "_lightning_fixed_table"):
         manager._lightning_fixed_table = pq.read_table(fixed_data(cfg))
@@ -275,13 +329,10 @@ def prepare_student_block(manager, index, policy_id):
                         loss_mask=[1] * len(tokens), response=tokenizer.decode(tokens, skip_special_tokens=False))
         return dict(prompt=row["prompt"], label=row["label"], metadata=metadata)
 
-    def batches():
-        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["precompute_concurrency"]) as pool:
-            for batch in table.to_batches(max_chunksize=1024):
-                yield list(pool.map(generate, batch.to_pylist()))
-
     print(f"Policy rollout {index + 1}/{cfg['policy_rollout_k']}: policy after step {block['start_step']}, {count:,} samples.", flush=True)
-    write_batches(rollouts, batches(), identity, count)
+    write_batches(rollouts, ordered_groups(generate, table.to_pylist(), cfg["precompute_concurrency"]), identity, count)
+    if shared is not None:
+        copy_block(rollouts, shared, shared_identity)
 
 
 def teacher_response_logprobs(output, tokens, sglang_vocab_size=None):
@@ -359,9 +410,8 @@ def score_teacher_block(args, index, policy_id):
         return row
 
     def batches():
-        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg["precompute_concurrency"]) as pool:
-            for batch in pq.ParquetFile(rollouts).iter_batches(batch_size=1024):
-                yield list(pool.map(score, batch.to_pylist()))
+        rows = [row for batch in pq.ParquetFile(rollouts).iter_batches(batch_size=ROW_GROUP) for row in batch.to_pylist()]
+        yield from ordered_groups(score, rows, cfg["precompute_concurrency"])
 
     with launcher.background(
         launcher.server_command(cfg, models["teacher"], cfg["precompute_port"],

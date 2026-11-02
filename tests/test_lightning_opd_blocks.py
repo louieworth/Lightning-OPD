@@ -192,6 +192,83 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(len(sampling), 6)
         self.assertEqual([params.get("stop_token_ids") for params in sampling], [[151645, 151643]] * 6)
 
+    def experiment(self, name, student="student", teacher="teacher"):
+        """Another experiment in the same output_dir; returns (cfg, args) ready for block preparation."""
+        cfg = dict(self.cfg, experiment_name=name, save_interval=self.cfg["eval_steps"])
+        run = blocks.run_directory(cfg)
+        run.mkdir(parents=True, exist_ok=True)
+        blocks.atomic_json(run / "initialization.json", dict(student=student, teacher=teacher))
+        blocks.prepare_fixed_prompts(cfg, student, Tokenizer())
+        (run / "config.yaml").write_text(yaml.safe_dump(cfg))
+        return cfg, types.SimpleNamespace(lightning_block_config=str(run / "config.yaml"), hf_checkpoint=student,
+                                          sglang_router_ip="localhost", sglang_router_port=1)
+
+    def generate_block(self, args, calls):
+        def request(url, payload):
+            calls.append(payload["sampling_params"]["sampling_seed"])
+            return dict(meta_info=dict(output_token_logprobs=[[-0.5, 7, ""]], finish_reason={"type": "stop"}))
+
+        transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()))
+        with patch.dict(sys.modules, {"configs.opd.qwen3-4b-opd": types.SimpleNamespace(request=request),
+                                      "transformers": transformers}):
+            blocks.prepare_student_block(types.SimpleNamespace(args=args), 0, "initial")
+
+    def test_block_files_record_their_student_and_teacher(self):
+        cfg, args = self.experiment("described", teacher="teacher-a")
+        self.generate_block(args, [])
+        path = blocks.block_paths(cfg, 0)[0]
+        recorded = json.loads(pq.read_schema(path).metadata[b"lightning_identity"])
+        self.assertEqual((recorded["student"], recorded["teacher"], recorded["policy_id"]), ("student", "teacher-a", "initial"))
+
+    def test_initial_student_rollouts_are_shared_by_experiments_with_another_teacher(self):
+        """Same initial student, prompts and seeds: a second teacher reuses the responses, a second student does not."""
+        first_cfg, first = self.experiment("pair-a", teacher="teacher-a")
+        generated = []
+        self.generate_block(first, generated)
+        self.assertEqual(len(generated), 6)
+        other_teacher_cfg, other_teacher = self.experiment("pair-b", teacher="teacher-b")
+        reused = []
+        self.generate_block(other_teacher, reused)
+        self.assertEqual(reused, [])
+        rows = lambda cfg: [row["metadata"]["response_tokens"] for row in pq.read_table(blocks.block_paths(cfg, 0)[0]).to_pylist()]
+        self.assertEqual(rows(other_teacher_cfg), rows(first_cfg))
+        recorded = json.loads(pq.read_schema(blocks.block_paths(other_teacher_cfg, 0)[0]).metadata[b"lightning_identity"])
+        self.assertEqual(recorded["teacher"], "teacher-b")
+        _, other_student = self.experiment("pair-c", student="student-c", teacher="teacher-a")
+        regenerated = []
+        self.generate_block(other_student, regenerated)
+        self.assertEqual(len(regenerated), 6)
+
+    def test_student_generation_streams_past_row_group_boundaries(self):
+        """A finished request frees its slot for the next row at once; no row group waits for its slowest row.
+
+        Row 0 can only finish after row 2 (the next row group) has started, which a per-group barrier
+        never allows. The rows are still written in their fixed order.
+        """
+        import threading
+
+        blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+        manager = types.SimpleNamespace(args=self.snapshot())
+        third_row_started = threading.Event()
+
+        def request(url, payload):
+            position = payload["sampling_params"]["sampling_seed"] - self.cfg["seed"]
+            if position == 2:
+                third_row_started.set()
+            if position == 0 and not third_row_started.wait(timeout=5):
+                raise TimeoutError("row 0 waited for its row group: generation is barrier-bound")
+            return dict(meta_info=dict(output_token_logprobs=[[-0.5, 100 + position, ""]], finish_reason={"type": "stop"}))
+
+        transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()))
+        with patch.object(blocks, "ROW_GROUP", 2), \
+                patch.dict(sys.modules, {"configs.opd.qwen3-4b-opd": types.SimpleNamespace(request=request),
+                                         "transformers": transformers}):
+            blocks.prepare_student_block(manager, 0, "initial")
+        rows = pq.read_table(blocks.block_paths(self.cfg, 0)[0]).to_pylist()
+        self.assertEqual([row["metadata"]["response_tokens"] for row in rows], [[100 + i] for i in range(6)])
+
     def test_real_parquet_generation_and_teacher_alignment(self):
         blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
         args = self.snapshot()
