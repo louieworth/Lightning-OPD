@@ -50,3 +50,6 @@ wandb/
 .env
 .env.*
 !.env.example
+
+# Run outputs of the 1102 presets (output_dir: <repo>/outputs): checkpoints, converted models, rollout caches.
+/outputs/
