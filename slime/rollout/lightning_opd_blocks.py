@@ -14,7 +14,6 @@ import json
 import math
 import os
 from pathlib import Path
-import random
 import uuid
 
 from slime.utils.opd_config import needs_teacher_features
@@ -69,7 +68,8 @@ def sequence_identity(cfg, student):
     source = Path(cfg["train_files"]).resolve()
     stat = source.stat()
     # K is deliberately excluded: all K variants use the same prompt order.
-    return dict(version=1, student=student, train_files=str(source),
+    # Version 2: source-file order on every pass (version 1 shuffled each pass).
+    return dict(version=2, student=student, train_files=str(source),
                 size=stat.st_size, mtime_ns=stat.st_mtime_ns,
                 max_train_samples=cfg["max_train_samples"],
                 max_prompt_len=cfg["rollout_max_prompt_len"],
@@ -79,7 +79,7 @@ def sequence_identity(cfg, student):
 
 
 def prepare_fixed_prompts(cfg, student, tokenizer=None):
-    """Repeat deterministically shuffled DAPO decks to exactly the training budget."""
+    """Repeat the eligible DAPO rows in source-file order to exactly the training budget."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -112,10 +112,7 @@ def prepare_fixed_prompts(cfg, student, tokenizer=None):
             raise ValueError("No DAPO prompts remain after prompt-length filtering.")
         rows, cycle = [], 0
         while len(rows) < identity["total_samples"]:
-            order = list(range(len(eligible)))
-            random.Random(cfg["rollout_seed"] + cycle).shuffle(order)
-            for index in order[:identity["total_samples"] - len(rows)]:
-                row = eligible[index]
+            for row in eligible[:identity["total_samples"] - len(rows)]:
                 metadata = dict(row["metadata"], lightning_sample_index=len(rows),
                                 lightning_source_index=row["source_index"], lightning_dataset_cycle=cycle)
                 rows.append(dict(prompt=row["prompt"], label=row["label"], metadata=metadata))
@@ -266,6 +263,7 @@ def prepare_student_block(manager, index, policy_id):
             sampling_params=dict(max_new_tokens=cfg["rollout_max_response_len"],
                                  temperature=cfg["rollout_temperature"], top_p=cfg["rollout_top_p"],
                                  top_k=cfg["rollout_top_k"], sampling_seed=cfg["seed"] + position,
+                                 stop_token_ids=cfg.get("rollout_stop_token_ids"),
                                  skip_special_tokens=False, no_stop_trim=False)))
         if output["meta_info"].get("finish_reason", {}).get("type") == "abort":
             raise RuntimeError(f"Student generation aborted at fixed sample {position}.")

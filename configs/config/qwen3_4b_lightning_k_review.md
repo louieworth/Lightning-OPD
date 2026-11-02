@@ -18,7 +18,7 @@ async_save: false
 
 总训练数据位置固定为 `150 × 256 = 38,400`。先读取 `/scratch/l/luli/data/lightning_opd/train/dapo_math_17k.parquet`，渲染初始学生的 chat template，再过滤超过 2,048 tokens 的 prompt。`max_train_samples` 限制的是源数据池，不能改变这里的 38,400 条预算。
 
-将过滤后的 DAPO 数据按 `rollout_seed + cycle` 打乱，每轮完整使用一次，重复到 38,400 条。重复的是 prompt，每个数据位置都有独立的 `lightning_sample_index` 和 sampling seed；每个位置生成自己的响应，不再循环读取同一个缓存响应来补足训练预算。
+将过滤后的 DAPO 数据按源文件顺序（不打乱），每轮完整使用一次，重复到 38,400 条。重复的是 prompt，每个数据位置都有独立的 `lightning_sample_index` 和 sampling seed；每个位置生成自己的响应，不再循环读取同一个缓存响应来补足训练预算。
 
 固定 prompt 序列的生成不依赖 K。同一源文件、模型 tokenizer、过滤设置、seed 和预算，在不同 K 实验中得到相同的 prompt 顺序。训练器不再额外 shuffle，block 内每条响应按固定顺序恰好参与一次更新。prompt 与 response 及教师打分都使用 Parquet。
 

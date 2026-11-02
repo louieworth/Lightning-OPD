@@ -95,6 +95,21 @@ class BlockTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "block plan changed"):
             blocks.prepare_fixed_prompts(dict(self.cfg, policy_rollout_k=3), "student", Tokenizer())
 
+    def test_fixed_sequence_keeps_source_order_on_every_pass(self):
+        rows = pq.read_table(blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())).to_pylist()
+        self.assertEqual([row["prompt"] for row in rows], ["one", "two", "three"] * 4)
+        self.assertEqual([row["metadata"]["lightning_dataset_cycle"] for row in rows],
+                         [cycle for cycle in range(4) for _ in range(3)])
+
+    def test_fixed_prompts_from_the_shuffled_recipe_are_not_reused(self):
+        path = blocks.fixed_data(self.cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pylist([dict(prompt="two", label="2", metadata={"sample_uid": "b"})] * 12), path)
+        legacy = dict(blocks.sequence_identity(self.cfg, "student"), version=1)
+        blocks.atomic_json(path.with_suffix(".manifest.json"), legacy)
+        with self.assertRaisesRegex(ValueError, "recipe changed"):
+            blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+
     def boundary_cache(self):
         blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
         args = self.snapshot()
@@ -158,6 +173,24 @@ class BlockTests(unittest.TestCase):
         args, _, rollouts, _ = self.boundary_cache()
         (rollouts.parent / "policy_checkpoint.json").unlink()
         self.assertEqual(blocks.boundary_policy_id(args, self.cfg, self.models, 1, 3, "new"), "new")
+
+    def test_student_block_generation_stops_at_configured_token_ids(self):
+        self.cfg["rollout_stop_token_ids"] = [151645, 151643]
+        blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+        manager = types.SimpleNamespace(args=self.snapshot())
+        sampling = []
+
+        def request(url, payload):
+            sampling.append(payload["sampling_params"])
+            return dict(meta_info=dict(output_token_logprobs=[[-0.5, 100, ""]], finish_reason={"type": "stop"}))
+
+        launcher = types.SimpleNamespace(request=request)
+        transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()))
+        with patch.dict(sys.modules, {"configs.opd.qwen3-4b-opd": launcher, "transformers": transformers}):
+            blocks.prepare_student_block(manager, 0, "initial")
+        self.assertEqual(len(sampling), 6)
+        self.assertEqual([params.get("stop_token_ids") for params in sampling], [[151645, 151643]] * 6)
 
     def test_real_parquet_generation_and_teacher_alignment(self):
         blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())

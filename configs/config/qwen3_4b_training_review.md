@@ -164,7 +164,7 @@ row.update(label=str(truth), metadata=metadata)
 
 9 个评测集合计 2,423 条。原始数据目录还有 `mmlu.parquet`、`amobench.parquet` 等文件，当前 YAML 未将它们加入 `val_files`。
 
-`max_train_samples: 100000` 是源数据池上限。输入适配保留全部 17,916 条，渲染后仍按 2,048 token 限制过滤。固定序列准备器重复打乱后的有效源数据，恰好构建 38,400 个训练位置。已有 9 份 eval Parquet；当前 Lightning YAML 选择其中 8 份，未选择 aime25。
+`max_train_samples: 100000` 是源数据池上限。输入适配保留全部 17,916 条，渲染后仍按 2,048 token 限制过滤。固定序列准备器按源文件顺序重复有效源数据（不打乱），恰好构建 38,400 个训练位置。已有 9 份 eval Parquet；当前 Lightning YAML 选择其中 8 份，未选择 aime25。
 
 **5. 选择初始学生模型与教师模型**
 
@@ -196,7 +196,7 @@ sbatch configs/sbatch/qwen3_4b_lightning_opd.sbatch
 
 **6. 固定 prompt、K 次 policy rollout 与 teacher logprob**
 
-共同启动器的 `prepare_lightning_data()` 在 `policy_rollout_k` 模式下仅调用 `prepare_fixed_prompts()`，使用过滤后的 DAPO 数据循环构建 38,400 条 prompt。顺序由 seed 确定，不依赖 K；训练器关闭额外 shuffle。每个重复 prompt 都有独立的绝对数据编号，并生成自己的响应。
+共同启动器的 `prepare_lightning_data()` 在 `policy_rollout_k` 模式下仅调用 `prepare_fixed_prompts()`，使用过滤后的 DAPO 数据循环构建 38,400 条 prompt。顺序为源文件顺序，不依赖 K；训练器关闭额外 shuffle。每个重复 prompt 都有独立的绝对数据编号，并生成自己的响应。
 
 [lightning_opd_blocks.py](../../slime/rollout/lightning_opd_blocks.py) 的 `schedule()` 按完整的 256 样本 batch 将 150 次更新分为 K 块。`BlockCoordinator.ensure_block()` 在每块开始时：
 
@@ -296,7 +296,7 @@ RolloutDataSource
 - [loss.py](../../slime/backends/megatron_utils/loss.py)：advantage 与损失聚合。
 - [ppo_utils.py](../../slime/utils/ppo_utils.py)：PPO 裁剪损失。
 
-固定 prompt builder 按 seed 打乱源 DAPO 的重复轮次；训练器不再额外 shuffle 或循环当前 block。`apply_chat_template: false` 用于离线训练，因为 prompt 已在准备阶段渲染。缓存采样器逐条检查绝对数据编号并恢复保存的响应：
+固定 prompt builder 按源文件顺序重复 DAPO，不打乱；训练器不再额外 shuffle 或循环当前 block。`apply_chat_template: false` 用于离线训练，因为 prompt 已在准备阶段渲染。缓存采样器逐条检查绝对数据编号并恢复保存的响应：
 
 ```python
 sample.tokens = prompt_tokens + response_tokens
@@ -622,7 +622,7 @@ sbatch configs/sbatch/qwen3_4b_lightning_opd.sbatch --resume
 
 `--resume` 恢复同一实验保存的模型、优化器／RNG 和数据读取状态。Lightning 支持从时限 checkpoint 所在的 block 中间恢复，使用原缓存的 policy ID 和绝对样本位置；后续 block 正常生成，不增加 block 边界 eval。`num_rollout: 150` 是总目标编号范围，恢复不会自动追加新的 150 次更新。使用其他初始化或教师时，应修改 `experiment_name`。
 
-两种 OPD 均要求 checkpoint、rollout cursor 和保存的训练配置完整；训练数据、batch、seed、打乱方式和优化器等配方改变时拒绝直接 resume。标准 OPD 按保存的 epoch 和样本偏移恢复相同打乱顺序，从下一批 prompt 继续读取；不会重新从第一批开始。评测列表和保存频率可调整。
+两种 OPD 均要求 checkpoint、rollout cursor 和保存的训练配置完整；训练数据、batch、seed、打乱方式和优化器等配方改变时拒绝直接 resume。标准 OPD 按保存的 epoch 和样本偏移恢复相同读取顺序（rollout_shuffle: false 时为源文件顺序），从下一批 prompt 继续读取；不会重新从第一批开始。评测列表和保存频率可调整。
 
 标准 OPD 使用 `sbatch configs/sbatch/qwen3_4b_opd.sbatch` 自动选择续训，也可以传 `--resume` 强制要求已有 checkpoint。若上次在原定 eval 步保存 checkpoint 后、评测写完前中断，`eval_on_resume: true` 会先补评测已载入的 checkpoint；非 eval 位置的时限 checkpoint 不额外触发评测。即使已保存第 150 次更新，也会补齐最终评测而不再进行训练更新；已有对应 JSON 时保留原来的评测。
 
@@ -711,7 +711,7 @@ source_data_dir: /scratch/l/luli/data
 train_files: /scratch/l/luli/data/lightning_opd/train/dapo_math_17k.parquet
 max_train_samples: 100000
 # null -> <output_dir>/<experiment_name>/data/fixed_prompts.parquet
-# Exactly num_rollout * rollout_batch_size rows, repeating shuffled DAPO decks.
+# Exactly num_rollout * rollout_batch_size rows, repeating DAPO in source-file order.
 # This prompt order is independent of K; responses/logprobs are cached per block.
 lightning_fixed_data: null
 input_key: prompt
@@ -720,7 +720,7 @@ metadata_key: metadata
 # Offline prompts are already rendered; never apply a second chat template.
 apply_chat_template: false
 apply_chat_template_kwargs: {enable_thinking: true}
-rollout_shuffle: false  # Keep fixed absolute positions; the builder shuffles DAPO decks.
+rollout_shuffle: false  # Fixed absolute positions; the builder keeps DAPO source-file order.
 rollout_seed: 42
 seed: 42
 num_rollout: 150  # README convergence setting; set 3000 to match the original launcher limit.

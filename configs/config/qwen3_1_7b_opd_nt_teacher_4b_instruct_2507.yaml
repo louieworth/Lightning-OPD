@@ -58,7 +58,7 @@ metadata_key: metadata
 # Standard OPD generates responses online from chat-formatted prompts.
 apply_chat_template: true
 apply_chat_template_kwargs: {enable_thinking: false}
-rollout_shuffle: true
+rollout_shuffle: false  # Read DAPO in source-file order, like Lightning OPD.
 rollout_seed: 42
 seed: 42
 num_rollout: 120  # 1 epoch: 14484 prompts / 128 batch = 113 → 120 (divisible by eval_steps=20).

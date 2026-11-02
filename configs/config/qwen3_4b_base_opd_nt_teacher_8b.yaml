@@ -60,7 +60,7 @@ metadata_key: metadata
 # Standard OPD generates responses online from chat-formatted prompts.
 apply_chat_template: true
 apply_chat_template_kwargs: {enable_thinking: false}
-rollout_shuffle: true
+rollout_shuffle: false  # Read DAPO in source-file order, like Lightning OPD.
 rollout_seed: 42
 seed: 42
 num_rollout: 120  # 1 epoch: 14484 prompts / 128 batch = 113 → 120 (divisible by eval_steps=20).
@@ -71,6 +71,8 @@ rollout_max_response_len: 16384
 rollout_temperature: 1.0
 rollout_top_p: 1.0
 rollout_top_k: -1
+# Stop on ChatML end-of-turn or native end-of-text; also used during evaluation.
+rollout_stop_token_ids: [151645, 151643]
 global_batch_size: 128
 balance_data: false
 

@@ -54,7 +54,7 @@ source_data_dir: /scratch/l/luli/data
 train_files: /scratch/l/luli/data/lightning_opd/train/dapo_math_17k_en.parquet
 max_train_samples: 100000
 # null -> <output_dir>/<experiment_name>/data/fixed_prompts.parquet
-# Exactly num_rollout * rollout_batch_size rows, repeating shuffled DAPO decks.
+# Exactly num_rollout * rollout_batch_size rows, repeating DAPO in source-file order.
 # This prompt order is independent of K; responses/logprobs are cached per block.
 lightning_fixed_data: null
 input_key: prompt
@@ -63,7 +63,7 @@ metadata_key: metadata
 # Offline prompts are already rendered; never apply a second chat template.
 apply_chat_template: false
 apply_chat_template_kwargs: {enable_thinking: false}
-rollout_shuffle: false  # Keep fixed absolute positions; the builder shuffles DAPO decks.
+rollout_shuffle: false  # Fixed absolute positions; the builder keeps DAPO source-file order.
 rollout_seed: 42
 seed: 42
 epoch: 1  # Total updates and fixed prompts scale with epoch; K is set explicitly below.
@@ -76,6 +76,8 @@ rollout_max_response_len: 16384
 rollout_temperature: 1.0
 rollout_top_p: 1.0
 rollout_top_k: -1
+# Stop on ChatML end-of-turn or native end-of-text; also used during evaluation.
+rollout_stop_token_ids: [151645, 151643]
 global_batch_size: 128
 balance_data: false
 
