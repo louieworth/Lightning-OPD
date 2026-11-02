@@ -3,9 +3,10 @@
 
 Each pair runs K=1 (Lightning OPD / Semi-OPD, method lightning_opd) and K=120 (standard OPD,
 method opd). Besides paths, models and the 16-GPU layout, the user approved changing only the
-evaluation (AIME24/25/26 + HMMT Feb26, avg@8, 32k response limit, a step-0 evaluation once),
-generation throughput and, for K=120, the SGLang memory share of its dedicated rollout GPUs.
-Every training setting must stay the original Slurm preset's.
+evaluation (AIME24/25/26 + HMMT Feb26, avg@8, 32k response limit, a step-0 evaluation once) and
+generation throughput. Every training setting must stay the original Slurm preset's.
+K=120 doubles the source preset's 2:4:2 GPU split (user decision 11/02, after a trial of rollout 10 /
+teacher TP2 / SGLang memory 0.85-0.7 sped up no training step).
 """
 
 from pathlib import Path
@@ -36,11 +37,6 @@ APPROVED_EVAL = {"val_files", "val_n", "val_max_completion_length", "val_before_
 # User-approved 2026-11-02: generation throughput only (requests in flight per SGLang engine and
 # client threads for block generation / teacher scoring); sampling seeds stay per data position.
 APPROVED_THROUGHPUT = {"sglang_max_running_requests": 64, "sglang_server_concurrency": 64, "precompute_concurrency": 1024}
-# User-approved 2026-11-02 after profiling A k120: K=120 rollout GPUs are dedicated (not shared with
-# the actor), and at 0.4 their KV cache filled during long evaluations; K=1 shares GPUs and keeps 0.4.
-# 0.85 left too little activation memory: at step 40 five engines ran out of memory computing the
-# logprobs of an 8k-token re-prefill (4.5 GiB logits), so 0.7 (KV still about 1.75x of 0.4).
-K120_ROLLOUT_MEMORY = {"sglang_mem_fraction_static": 0.7}
 
 
 def load(name):
@@ -71,9 +67,8 @@ class Byte16PresetTests(unittest.TestCase):
             with self.subTest(config=name):
                 cfg, original = load(name), load(source(k))
                 changed = {key for key in cfg.keys() | original.keys() if cfg.get(key) != original.get(key)}
-                approved = dict(APPROVED_THROUGHPUT, **(K120_ROLLOUT_MEMORY if k == "k120" else {}))
-                self.assertEqual(changed - PATHS_AND_LAYOUT - APPROVED_EVAL - set(approved), set())
-                self.assertEqual({key: cfg[key] for key in approved}, approved)
+                self.assertEqual(changed - PATHS_AND_LAYOUT - APPROVED_EVAL - set(APPROVED_THROUGHPUT), set())
+                self.assertEqual({key: cfg[key] for key in APPROVED_THROUGHPUT}, APPROVED_THROUGHPUT)
 
     def test_pairs_models_and_approved_evaluation(self):
         evaluation = [f"/opt/tiger/Lightning-OPD/data/lightning_opd/eval/{name}.parquet"
@@ -89,18 +84,16 @@ class Byte16PresetTests(unittest.TestCase):
                 self.assertEqual((cfg["ray_cluster"], cfg["nnodes"], cfg["n_gpus_per_node"]), ("existing", 2, 8))
                 self.assertEqual(cfg["experiment_name"], f"{pair}_{k}_byte16")
 
-    def test_opd_gives_two_of_the_doubled_teacher_gpus_to_rollout(self):
-        # User-approved 2026-11-02: the doubled 2:4:2 split (actor 4, rollout 8, teacher TP4) kept the
-        # teacher about 5% busy, so two teacher GPUs serve rollout: actor 4, rollout 10, teacher TP2.
+    def test_opd_doubles_the_source_gpu_split(self):
         def split(cfg):
             return (cfg["actor_num_nodes"] * cfg["actor_num_gpus_per_node"], cfg["rollout_num_gpus"],
                     cfg["teacher_num_gpus"], cfg["teacher_tp_size"])
 
-        actor, rollout, teacher, _ = (2 * gpus for gpus in split(load(K120_SOURCE)))
+        doubled = tuple(2 * gpus for gpus in split(load(K120_SOURCE)))
         for name, (_, k) in PRESETS.items():
             if k == "k120":
                 with self.subTest(config=name):
-                    self.assertEqual(split(load(name)), (actor, rollout + 2, teacher - 2, teacher - 2))
+                    self.assertEqual(split(load(name)), doubled)
 
     def test_step_zero_is_evaluated_once_per_student(self):
         evaluated = sorted(name for name in PRESETS if load(name)["val_before_train"])
