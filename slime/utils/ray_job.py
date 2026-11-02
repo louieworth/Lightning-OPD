@@ -82,6 +82,16 @@ def _other_nodes():
     return [node for node in ray.nodes() if node["Alive"] and node["NodeID"] != here]
 
 
+def gpu_nodes(count):
+    """Ray addresses (e.g. "[fd00::1]") of the first `count` alive GPU nodes, this node first."""
+    import ray
+
+    here = ray.get_runtime_context().get_node_id()
+    nodes = [node for node in ray.nodes() if node["Alive"] and node["Resources"].get("GPU", 0) > 0]
+    nodes.sort(key=lambda node: node["NodeID"] != here)
+    return [node["NodeManagerAddress"] for node in nodes[:count]]
+
+
 def _pinned(function, node):
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -164,24 +174,29 @@ def mirror(root, exclude=()):
 
 
 @contextlib.contextmanager
-def gpu_process(command, env, num_gpus, resources, log_path):
-    """Run `command` while Ray holds `num_gpus` GPUs for it (placed by `resources`), so trainers cannot take them.
+def gpu_process(command, env, num_gpus, resources, log_path, devices=None):
+    """Run `command` on the node `resources` selects, while Ray holds `num_gpus` GPUs for it.
 
-    The process gets the GPUs Ray assigned via CUDA_VISIBLE_DEVICES and is stopped on exit.
+    The process gets the GPUs Ray assigned via CUDA_VISIBLE_DEVICES, or `devices` when the caller already owns
+    GPUs that Ray has handed out (then num_gpus is 0). env=None runs it in the Ray worker's environment.
+    Yields a Popen-like view (poll, returncode); the process is stopped on exit.
     """
     import ray
 
     class Holder:
-        def __init__(self, command, env, log_path):
+        def __init__(self, command, env, log_path, devices):
+            import os
+            from pathlib import Path
             import subprocess
 
-            gpus = ",".join(str(gpu) for gpu in ray.get_gpu_ids())
+            gpus = devices if devices is not None else ",".join(str(gpu) for gpu in ray.get_gpu_ids())
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
             self.log = open(log_path, "ab")
-            self.process = subprocess.Popen(command, env=dict(env, CUDA_VISIBLE_DEVICES=gpus),
+            self.process = subprocess.Popen(command, env=dict(os.environ if env is None else env, CUDA_VISIBLE_DEVICES=gpus),
                                             stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
 
-        def running(self):
-            return self.process.poll() is None
+        def poll(self):
+            return self.process.poll()
 
         def stop(self):
             import os
@@ -197,12 +212,20 @@ def gpu_process(command, env, num_gpus, resources, log_path):
                     self.process.wait()
             self.log.close()
 
+    class Process:
+        returncode = None
+
+        def poll(self):
+            self.returncode = ray.get(holder.poll.remote())
+            return self.returncode
+
     holder = ray.remote(num_cpus=0, num_gpus=num_gpus)(Holder).options(resources=resources).remote(
-        command, env, str(log_path))
+        command, env, str(log_path), devices)
     try:
-        if not ray.get(holder.running.remote()):
+        process = Process()
+        if process.poll() is not None:
             raise RuntimeError(f"GPU process exited at startup; inspect {log_path}.")
-        yield holder
+        yield process
     finally:
         try:
             ray.get(holder.stop.remote())

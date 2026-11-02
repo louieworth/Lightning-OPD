@@ -152,9 +152,10 @@ class ExistingClusterLaunchTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "free GPUs"):
             self.launch(free_gpus=4.0)
 
-    def test_two_node_job_mirrors_code_and_initial_checkpoint_and_spans_nodes(self):
+    def test_two_node_job_mirrors_code_initial_checkpoint_and_teacher_and_spans_nodes(self):
         calls, _, mirrored, checkpoint = self.launch(free_gpus=8.0, nnodes=2, actor_num_nodes=2, rollout_num_gpus=16)
-        self.assertEqual(mirrored, [ROOT, checkpoint])
+        # Lightning OPD scores its blocks with the teacher on every node.
+        self.assertEqual(mirrored, [ROOT, checkpoint, Path("teacher")])
         [(command, options)] = calls
         self.assertEqual(options["env"][ray_job.NODE_ENV], NODE)
         self.assertNotIn(ray_job.SINGLE_NODE_ENV, options["env"])

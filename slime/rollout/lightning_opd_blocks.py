@@ -8,6 +8,7 @@ student inference -> offload inference -> teacher scoring -> stop teacher -> tra
 """
 
 import concurrent.futures
+import contextlib
 import hashlib
 import importlib
 import json
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import uuid
 
+from slime.utils import ray_job
 from slime.utils.opd_config import needs_teacher_features
 
 
@@ -369,8 +371,27 @@ def teacher_response_logprobs(output, tokens, sglang_vocab_size=None):
     return values
 
 
+def scoring_servers(cfg, nodes, visible=None):
+    """(node, CUDA devices, port) of each teacher scoring server.
+
+    Scoring runs while every Ray model is offloaded, so the servers fill every GPU of every node,
+    teacher_tp_size GPUs each. Logical GPU i of a node is the i-th entry of `visible` (this node's
+    CUDA_VISIBLE_DEVICES; Slurm may assign a subset). Feature scoring caches teacher features on its
+    node's disk, which other nodes cannot read, so it keeps one server on the first node (this one).
+    """
+    tp, per_node = cfg["teacher_tp_size"], cfg["n_gpus_per_node"]
+    devices = visible.split(",") if visible else [str(gpu) for gpu in range(per_node)]
+    if per_node % tp or len(devices) < per_node:
+        raise ValueError(f"Teacher scoring splits {per_node} GPUs per node into groups of teacher_tp_size={tp}; "
+                         f"visible devices: {','.join(devices)}.")
+    if needs_teacher_features(cfg):
+        nodes, per_node = nodes[:1], tp
+    return [(node, ",".join(devices[first:first + tp]), cfg["precompute_port"] + first // tp)
+            for node in nodes for first in range(0, per_node, tp)]
+
+
 def score_teacher_block(args, index, policy_id):
-    """The driver owns Slurm's head-node GPUs while all Ray models are offloaded."""
+    """Score a block's cached student rollouts with the teacher on every GPU of the job (see scoring_servers)."""
     import pyarrow.parquet as pq
     from transformers import AutoConfig, AutoTokenizer
 
@@ -396,16 +417,13 @@ def score_teacher_block(args, index, policy_id):
     sglang_vocab_size = None if needs_teacher_features(cfg) else AutoConfig.from_pretrained(
         models["teacher"], trust_remote_code=True).vocab_size
     launcher = importlib.import_module("configs.opd.qwen3-4b-opd")
-    env = os.environ.copy()
-    devices = env.get("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(cfg["n_gpus_per_node"])))).split(",")
-    if len(devices) < cfg["teacher_tp_size"]:
-        raise ValueError("Teacher TP exceeds the head node's visible GPUs.")
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(devices[:cfg["teacher_tp_size"]])
-    url = f"http://127.0.0.1:{cfg['precompute_port']}"
+    servers = scoring_servers(cfg, ray_job.gpu_nodes(cfg["nnodes"]), os.environ.get("CUDA_VISIBLE_DEVICES"))
+    urls = [f"http://{node}:{port}" for node, _, port in servers]
 
-    def score(row):
+    def score(item):
+        position, row = item
         tokens = row["metadata"]["response_tokens"]
-        output = launcher.request(url + "/generate", dict(
+        output = launcher.request(urls[position % len(urls)] + "/generate", dict(
             input_ids=tokenizer.encode(row["prompt"], add_special_tokens=False) + tokens,
             sampling_params=dict(temperature=0, max_new_tokens=0, skip_special_tokens=False),
             return_logprob=True, logprob_start_len=0,
@@ -420,14 +438,17 @@ def score_teacher_block(args, index, policy_id):
 
     def batches():
         rows = [row for batch in pq.ParquetFile(rollouts).iter_batches(batch_size=ROW_GROUP) for row in batch.to_pylist()]
-        yield from ordered_groups(score, rows, cfg["precompute_concurrency"])
+        yield from ordered_groups(score, list(enumerate(rows)), cfg["precompute_concurrency"])
 
-    with launcher.background(
-        launcher.server_command(cfg, models["teacher"], cfg["precompute_port"],
-                                cfg["teacher_tp_size"], cfg["teacher_mem_fraction_static"], True),
-        env, scored.parent / "teacher.log",
-    ) as process:
-        launcher.wait_ready(url + "/health_generate", cfg["startup_timeout"], process)
+    with contextlib.ExitStack() as stack:
+        # Start every server before waiting for any, so they load the teacher at the same time.
+        processes = [stack.enter_context(ray_job.gpu_process(
+            launcher.server_command(cfg, models["teacher"], port, cfg["teacher_tp_size"],
+                                    cfg["teacher_mem_fraction_static"], True, node.strip("[]")),
+            None, 0, {f"node:{node}": 0.001}, scored.parent / f"teacher-{port}.log", devices))
+            for node, devices, port in servers]
+        for url, process in zip(urls, processes, strict=True):
+            launcher.wait_ready(url + "/health_generate", cfg["startup_timeout"], process)
         write_batches(scored, batches(), teacher_identity(cfg, identity), count)
 
 

@@ -4,6 +4,7 @@ import ast
 import contextlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -16,6 +17,7 @@ import pyarrow.parquet as pq
 import yaml
 
 from slime.rollout import lightning_opd_blocks as blocks
+from slime.utils import ray_job
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -57,9 +59,19 @@ class BlockTests(unittest.TestCase):
             dict(prompt="too long for filtering", label="4", metadata={"sample_uid": "d"}),
         ]), self.cfg["train_files"])
         self.models = dict(student="student", teacher="teacher")
+        self.launched = []
+        cluster = patch.multiple(ray_job, gpu_nodes=lambda count: ["[fd00::1]", "[fd00::2]"][:count],
+                                 gpu_process=self.gpu_process)
+        cluster.start()
+        self.addCleanup(cluster.stop)
         self.run = blocks.run_directory(self.cfg)
         self.run.mkdir()
         blocks.atomic_json(self.run / "initialization.json", self.models)
+
+    @contextlib.contextmanager
+    def gpu_process(self, command, env, num_gpus, resources, log_path, devices=None):
+        self.launched.append((command, num_gpus, resources, devices))
+        yield types.SimpleNamespace(poll=lambda: None, returncode=None)
 
     def snapshot(self):
         self.cfg["save_interval"] = self.cfg["eval_steps"]
@@ -277,6 +289,63 @@ class BlockTests(unittest.TestCase):
         rows = pq.read_table(blocks.block_paths(self.cfg, 0)[0]).to_pylist()
         self.assertEqual([row["metadata"]["response_tokens"] for row in rows], [[100 + i] for i in range(6)])
 
+    def test_teacher_scoring_spreads_over_every_gpu_of_every_node(self):
+        # Scoring runs while every Ray model is offloaded; one teacher on two GPUs left 14 of 16 idle (D k1, 11/02).
+        self.cfg.update(nnodes=2, n_gpus_per_node=4, teacher_tp_size=2, precompute_port=7000)
+        blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+        args = self.snapshot()
+        manager = types.SimpleNamespace(args=args)
+        scored_at, ready = [], []
+
+        def request(url, payload):
+            if payload["sampling_params"]["max_new_tokens"]:
+                return dict(meta_info=dict(output_token_logprobs=[[-.5, 100, ""]], finish_reason={"type": "stop"}))
+            scored_at.append(url)
+            ids = payload["input_ids"]
+            return dict(meta_info=dict(input_token_logprobs=[[None, ids[0], ""]] + [[-.2, t, ""] for t in ids[1:]]))
+
+        launcher = types.SimpleNamespace(
+            request=request, wait_ready=lambda url, timeout, process: ready.append(url),
+            server_command=lambda cfg, model, port, tp, memory, scoring, host: [model, port, tp, scoring, host])
+        transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()),
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **kw: types.SimpleNamespace(vocab_size=151936)))
+        with patch.dict(sys.modules, {"configs.opd.qwen3-4b-opd": launcher, "transformers": transformers}), \
+                patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,5,6,7"}):
+            blocks.prepare_student_block(manager, 0, "initial")
+            blocks.score_teacher_block(args, 0, "initial")
+        servers = [(node, port, devices) for node in ("[fd00::1]", "[fd00::2]")
+                   for port, devices in ((7000, "4,5"), (7001, "6,7"))]
+        self.assertEqual(self.launched, [(["teacher", port, 2, True, node.strip("[]")], 0, {f"node:{node}": 0.001},
+                                          devices) for node, port, devices in servers])
+        urls = [f"http://{node}:{port}" for node, port, _ in servers]
+        self.assertEqual(ready, [url + "/health_generate" for url in urls])
+        self.assertEqual(set(scored_at), {url + "/generate" for url in urls})
+        rows = pq.read_table(blocks.block_paths(self.cfg, 0)[1]).to_pylist()
+        self.assertEqual([row["metadata"]["lightning_sample_index"] for row in rows], list(range(6)))
+        self.assertTrue(all(row["metadata"]["teacher_log_probs"] == [-.2] for row in rows))
+
+    def test_scoring_servers_fill_each_node_in_teacher_tp_groups(self):
+        cfg = dict(self.cfg, n_gpus_per_node=8, teacher_tp_size=4, precompute_port=7000)
+        self.assertEqual(blocks.scoring_servers(cfg, ["a", "b"]), [
+            ("a", "0,1,2,3", 7000), ("a", "4,5,6,7", 7001), ("b", "0,1,2,3", 7000), ("b", "4,5,6,7", 7001)])
+        # Slurm can hand this node a subset of its GPUs; logical GPU i is the i-th visible device.
+        self.assertEqual(blocks.scoring_servers(dict(cfg, n_gpus_per_node=4, teacher_tp_size=2), ["a"], "4,5,6,7"),
+                         [("a", "4,5", 7000), ("a", "6,7", 7001)])
+        # Feature scoring caches teacher features on its node's disk, which the other nodes cannot read.
+        self.assertEqual(blocks.scoring_servers(dict(cfg, opd_loss_token_mode="full_vocab"), ["a", "b"]),
+                         [("a", "0,1,2,3", 7000)])
+        for bad in (dict(cfg, teacher_tp_size=3), dict(cfg, n_gpus_per_node=8, teacher_tp_size=2)):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "teacher_tp_size"):
+                blocks.scoring_servers(bad, ["a"], "0,1,2,3" if bad["teacher_tp_size"] == 2 else None)
+
+    def test_scoring_servers_listen_on_their_node_address(self):
+        launcher = importlib.import_module("configs.opd.qwen3-4b-opd")
+        for mode in ("sample", "full_vocab"):
+            command = launcher.server_command(dict(self.cfg, opd_loss_token_mode=mode), "teacher", 7000, 2, .6, True,
+                                              "fd00::2")
+            self.assertEqual(command[command.index("--host") + 1], "fd00::2", mode)
+
     def test_real_parquet_generation_and_teacher_alignment(self):
         blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
         args = self.snapshot()
@@ -294,11 +363,7 @@ class BlockTests(unittest.TestCase):
                 items[-1][1] += 1
             return dict(meta_info=dict(input_token_logprobs=items))
 
-        @contextlib.contextmanager
-        def background(*args):
-            yield object()
-
-        launcher = types.SimpleNamespace(request=request, background=background,
+        launcher = types.SimpleNamespace(request=request,
                                          server_command=lambda *args: [], wait_ready=lambda *args: None)
         transformers = types.SimpleNamespace(
             AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()),
@@ -395,11 +460,7 @@ class BlockTests(unittest.TestCase):
             items = [[None, ids[0], ""]] + [[-.2, token if token < 151935 else 0, ""] for token in ids[1:]]
             return dict(meta_info=dict(input_token_logprobs=items))
 
-        @contextlib.contextmanager
-        def background(*args):
-            yield object()
-
-        launcher = types.SimpleNamespace(request=request, background=background, server_command=lambda *a: [],
+        launcher = types.SimpleNamespace(request=request, server_command=lambda *a: [],
                                          wait_ready=lambda *a: None)
         transformers = types.SimpleNamespace(
             AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()),
@@ -440,11 +501,7 @@ class BlockTests(unittest.TestCase):
                 metadata["opd_teacher_features"] = feature_reference
             return dict(meta_info=metadata)
 
-        @contextlib.contextmanager
-        def background(*args):
-            yield object()
-
-        launcher = types.SimpleNamespace(request=request, background=background, server_command=lambda *a: [],
+        launcher = types.SimpleNamespace(request=request, server_command=lambda *a: [],
                                          wait_ready=lambda *a: None)
         transformers = types.SimpleNamespace(
             AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: Tokenizer()),

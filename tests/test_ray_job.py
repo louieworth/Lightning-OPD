@@ -6,6 +6,10 @@ always runs on the launcher's node; GPU bundles are pinned there too when the jo
 
 import json
 import os
+from pathlib import Path
+import sys
+import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -90,6 +94,66 @@ class PinnedSchedulingTests(unittest.TestCase):
         with patch.dict(os.environ, PINNED), patch.object(placement_group, "RolloutManager", Manager):
             placement_group.create_rollout_manager(args, pg=None)
         self.assertEqual(captured.get("resources"), {"node:[fd00::1]": 0.001})
+
+
+def local_ray(nodes=(), here=None, gpu_ids=()):
+    """A stand-in for ray that runs remote actors in this process and records how they were requested."""
+    requested = {}
+
+    class Handle:
+        def __init__(self, instance):
+            self.instance = instance
+
+        def __getattr__(self, name):
+            return types.SimpleNamespace(remote=getattr(self.instance, name))
+
+    def remote(**options):
+        requested.update(options)
+        return lambda cls: types.SimpleNamespace(
+            options=lambda **more: requested.update(more) or types.SimpleNamespace(
+                remote=lambda *args: Handle(cls(*args))))
+
+    ray = types.SimpleNamespace(remote=remote, get=lambda value: value, kill=lambda handle: None,
+                                get_gpu_ids=lambda: list(gpu_ids), nodes=lambda: list(nodes),
+                                get_runtime_context=lambda: types.SimpleNamespace(get_node_id=lambda: here))
+    return ray, requested
+
+
+def node(node_id, address, gpus=8.0, alive=True):
+    return dict(NodeID=node_id, NodeManagerAddress=address, Alive=alive, Resources={"GPU": gpus} if gpus else {})
+
+
+class GpuNodeTests(unittest.TestCase):
+    def test_alive_gpu_nodes_with_this_node_first(self):
+        nodes = [node("cpu", "[fd00::9]", gpus=0), node("other", "[fd00::2]"), node("dead", "[fd00::3]", alive=False),
+                 node("here", "[fd00::1]")]
+        ray, _ = local_ray(nodes, here="here")
+        with patch.dict(sys.modules, {"ray": ray}):
+            self.assertEqual(ray_job.gpu_nodes(2), ["[fd00::1]", "[fd00::2]"])
+            self.assertEqual(ray_job.gpu_nodes(1), ["[fd00::1]"])
+
+
+class GpuProcessTests(unittest.TestCase):
+    def run_process(self, devices=None, gpu_ids=(), num_gpus=0):
+        ray, requested = local_ray(gpu_ids=gpu_ids)
+        command = [sys.executable, "-c", "import os, sys, time; print(os.environ['CUDA_VISIBLE_DEVICES']); time.sleep(.5); sys.exit(3)"]
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {"ray": ray}):
+            log = Path(directory) / "not-yet-made/teacher.log"
+            with ray_job.gpu_process(command, None, num_gpus, {"node:[fd00::2]": 0.001}, log, devices) as process:
+                deadline = time.monotonic() + 30
+                while process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            return process.returncode, log.read_text().strip(), requested
+
+    def test_a_process_on_gpus_its_caller_owns_reserves_none_through_ray(self):
+        # Teacher scoring runs while every Ray model is offloaded but their placement group still holds all GPUs.
+        returncode, visible, requested = self.run_process(devices="2,3")
+        self.assertEqual((returncode, visible), (3, "2,3"))
+        self.assertEqual((requested["num_gpus"], requested["resources"]), (0, {"node:[fd00::2]": 0.001}))
+
+    def test_a_process_without_devices_gets_the_gpus_ray_assigned(self):
+        returncode, visible, requested = self.run_process(gpu_ids=(4, 5), num_gpus=2)
+        self.assertEqual((returncode, visible, requested["num_gpus"]), (3, "4,5", 2))
 
 
 if __name__ == "__main__":

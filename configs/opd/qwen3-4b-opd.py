@@ -797,10 +797,10 @@ def background(command, env, log_path):
                     process.wait()
 
 
-def server_command(cfg, model, port, tp, memory, teacher_scoring=False):
+def server_command(cfg, model, port, tp, memory, teacher_scoring=False, host="0.0.0.0"):
     if teacher_scoring and needs_teacher_features(cfg):
         return [sys.executable, "-m", "slime.rollout.opd_teacher", "--model-path", model,
-                "--port", str(port), "--cache-dir", str(run_dir(cfg) / "data/teacher_features"),
+                "--host", host, "--port", str(port), "--cache-dir", str(run_dir(cfg) / "data/teacher_features"),
                 "--context-length", str(cfg["teacher_context_length"]),
                 "--chunk-size", str(cfg.get("opd_distribution_chunk_size", 32)),
                 "--memory-fraction", str(memory)]
@@ -811,7 +811,7 @@ def server_command(cfg, model, port, tp, memory, teacher_scoring=False):
         "--model-path",
         model,
         "--host",
-        "0.0.0.0",
+        host,
         "--port",
         str(port),
         "--tp",
@@ -1217,6 +1217,8 @@ def train_existing_cluster(cfg, student, teacher, env):
         prepare_head(cfg, student, teacher, env, env)
         if cfg["nnodes"] > 1:
             ray_job.mirror(checkpoint_path(cfg, student))
+            if cfg["method"] == "lightning_opd":  # Block scoring runs the teacher on every node.
+                ray_job.mirror(teacher)
         public, secret = ray_job.split_secrets(env)
         workers = {key: value for key, value in public.items()
                    if key != "CUDA_VISIBLE_DEVICES" and not key.startswith("RAY_")}
