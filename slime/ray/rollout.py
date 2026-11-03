@@ -610,6 +610,16 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
                 f"eval/{key}-",
             )
 
+    # Unweighted mean over the evaluated datasets (W&B: eval_metric/all-avg@k and all-pass@k).
+    counts = {key: eval_counts.get(key, args.n_samples_per_eval_prompt) for key in data.keys()}
+    if len(set(counts.values())) == 1:
+        (count,) = set(counts.values())
+        log_dict[f"eval_metric/all-avg@{count}"] = sum(
+            log_dict[f"eval_metric/{key}-avg@{count}"] for key in counts) / len(counts)
+        passes = [log_dict.get(f"eval/{key}/pass@{count}") for key in counts]
+        if None not in passes:
+            log_dict[f"eval/all/pass@{count}"] = sum(passes) / len(passes)
+
     logger.info(f"eval {rollout_id}: {log_dict}")
 
     if completed_steps is None:

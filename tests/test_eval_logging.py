@@ -66,7 +66,8 @@ class EvalLoggingTests(unittest.TestCase):
         data = {"amc23": {"rewards": [1.0, 0.0]}, "hmmt26": {"rewards": [1.0]}}
         result = self.log_eval(0, self.args, data, {"eval/hmmt26/avg@1": 0.0})
         averages = {key: value for key, value in result.items() if key.startswith("eval_metric/")}
-        self.assertEqual(averages, {"eval_metric/amc23-avg@2": 0.5, "eval_metric/hmmt26-avg@2": 0.0})
+        self.assertEqual(averages, {"eval_metric/amc23-avg@2": 0.5, "eval_metric/hmmt26-avg@2": 0.0,
+                                    "eval_metric/all-avg@2": 0.25})
         self.assertFalse(any(key.startswith("eval/") and key.endswith("/avg@1") for key in result))
         self.assertNotIn("eval/amc23", result)
         self.assertNotIn("eval/hmmt26", result)
@@ -88,6 +89,17 @@ class EvalLoggingTests(unittest.TestCase):
         self.assertNotIn("eval_metric/amc23-avg@1", result)
         self.assertNotIn("eval/amc23/avg@4", result)
         self.assertEqual(source["eval/amc23/avg@1"], 0.5)
+
+    def test_all_datasets_mean_avg_and_pass_reach_wandb(self):
+        from slime.utils.wandb_metrics import filter_wandb_metrics
+
+        self.args.log_passrate = False
+        source = {"eval/aime24/avg@2": 0.5, "eval/aime24/pass@2": 0.75,
+                  "eval/hmmt26/avg@2": 0.1, "eval/hmmt26/pass@2": 0.25}
+        data = {"aime24": {"rewards": [1, 0]}, "hmmt26": {"rewards": [0, 0]}}
+        logged = filter_wandb_metrics(self.log_eval(19, self.args, data, source))
+        self.assertAlmostEqual(logged["eval_metric/all-avg@2"], 0.3)
+        self.assertAlmostEqual(logged["eval_metric/all-pass@2"], 0.5)
 
     def test_initial_periodic_and_final_steps_use_completed_updates(self):
         self.args.log_passrate = False
