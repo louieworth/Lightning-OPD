@@ -3,7 +3,8 @@
     python3 tools/make_byte16_presets.py
 
 Four teacher-student pairs from "When Do We Need On-Policy Distillation?" (arXiv 2610.11291,
-Table 3 rows a, d, i, l), each as K=1 (Lightning OPD / Semi-OPD) and K=120 (standard OPD).
+Table 3 rows a, d, i, l), each as K=1 (Lightning OPD / Semi-OPD), K=40 (Lightning OPD with 40 current-policy
+rollout blocks of 3 steps; user request 11/03) and K=120 (standard OPD).
 Every training setting comes from the Qwen3-1.7B / Qwen3-4B-Instruct-2507 Slurm presets; only paths,
 models, the 16-GPU layout and the user-approved evaluation and throughput settings change.
 tests/test_byte16_presets.py enforces exactly that.
@@ -18,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIGS = ROOT / "configs/config"
 MODELS = Path("/opt/tiger/models")
 DATA = ROOT / "data/lightning_opd"
-SOURCES = {"k1": "qwen3_1_7b_nt_teacher_4b_instruct_2507_k1.yaml",
+SOURCES = {"k1": "qwen3_1_7b_nt_teacher_4b_instruct_2507_k1.yaml", "k40": "qwen3_1_7b_nt_teacher_4b_instruct_2507_k1.yaml",
            "k120": "qwen3_1_7b_opd_nt_teacher_4b_instruct_2507.yaml"}
 PAIRS = {  # name -> (student, teacher, model_type, chat template kwargs)
     "qwen3_1_7b_nt_teacher_4b_instruct_2507": ("Qwen3-1.7B", "Qwen3-4B-Instruct-2507", "qwen3-1.7B", {"enable_thinking": False}),
@@ -42,6 +43,7 @@ COMMON = dict(
 )
 LAYOUT = {
     "k1": dict(actor_num_nodes=2, actor_num_gpus_per_node=8, colocate=True, rollout_num_gpus=16),
+    "k40": dict(actor_num_nodes=2, actor_num_gpus_per_node=8, colocate=True, rollout_num_gpus=16, policy_rollout_k=40),
     # The source preset's 2 : 4 : 2 split doubled, with its SGLang memory share 0.4 (user decision
     # 11/02: rollout 10 / teacher TP2 / memory 0.85-0.7 sped up no training step of A k120).
     "k120": dict(actor_num_nodes=1, actor_num_gpus_per_node=4, colocate=False, rollout_num_gpus=8,
@@ -102,7 +104,7 @@ def main():
             if "wandb_dir" in yaml.safe_load(text):
                 values["wandb_dir"] = f"wandb/{name}"
             target = CONFIGS / f"byte16_{pair}_{k}.yaml"
-            method = "Lightning OPD / Semi-OPD" if k == "k1" else "standard OPD"
+            method = {"k1": "Lightning OPD / Semi-OPD", "k40": "Lightning OPD, 40 rollout blocks"}.get(k, "standard OPD")
             target.write_text(HEADER.format(source=source, k=k[1:], method=method) + override(text, values))
             cfg = yaml.safe_load(target.read_text())
             assert all(cfg[key] == value for key, value in values.items()), target
