@@ -37,6 +37,10 @@ APPROVED_EVAL = {"val_files", "val_n", "val_max_completion_length", "val_before_
 # User-approved 2026-11-02: generation throughput only (requests in flight per SGLang engine and
 # client threads for block generation / teacher scoring); sampling seeds stay per data position.
 APPROVED_THROUGHPUT = {"sglang_max_running_requests": 64, "sglang_server_concurrency": 64, "precompute_concurrency": 1024}
+# User-approved 2026-11-02: D k120's 7B actor (4 GPUs, TP2) failed step 3 allocating 4.64 GiB of logits
+# while PyTorch held 10.28 GiB reserved but unallocated. Allocator only, training processes only.
+APPROVED_MEMORY = {"byte16_r1_distill_qwen_7b_teacher_light_r1_14b_k120.yaml": {
+    "train_env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}}
 
 
 def load(name):
@@ -67,8 +71,15 @@ class Byte16PresetTests(unittest.TestCase):
             with self.subTest(config=name):
                 cfg, original = load(name), load(source(k))
                 changed = {key for key in cfg.keys() | original.keys() if cfg.get(key) != original.get(key)}
-                self.assertEqual(changed - PATHS_AND_LAYOUT - APPROVED_EVAL - set(APPROVED_THROUGHPUT), set())
+                memory = APPROVED_MEMORY.get(name, {})
+                self.assertEqual(changed - PATHS_AND_LAYOUT - APPROVED_EVAL - set(APPROVED_THROUGHPUT) - set(memory), set())
                 self.assertEqual({key: cfg[key] for key in APPROVED_THROUGHPUT}, APPROVED_THROUGHPUT)
+
+    def test_only_d_k120_training_uses_expandable_segments(self):
+        for name, (_, k) in PRESETS.items():
+            with self.subTest(config=name):
+                expected = APPROVED_MEMORY.get(name, {}).get("train_env_vars", load(source(k)).get("train_env_vars"))
+                self.assertEqual(load(name).get("train_env_vars"), expected)
 
     def test_pairs_models_and_approved_evaluation(self):
         evaluation = [f"/opt/tiger/Lightning-OPD/data/lightning_opd/eval/{name}.parquet"

@@ -162,3 +162,4 @@ save_retain_interval: null  # Disable Megatron's separate interval-based pruning
 async_save: false
 # Keys added for the 1102 cluster.
 ray_cluster: existing
+train_env_vars: {PYTORCH_CUDA_ALLOC_CONF: 'expandable_segments:True'}
