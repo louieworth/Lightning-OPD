@@ -57,10 +57,10 @@ APPROVED_CONTEXT = {f"byte16_{pair}_{k}.yaml": {"sglang_context_length": 40960}
                     for k in ("k1", "k40", "k120")}
 
 
-# User-approved 11/04: larger engine batches for the 4B base pair (memory 0.7 on dedicated rollout GPUs).
+# User-approved 11/04: larger engine batches for the 4B base pair (memory 0.6 on dedicated rollout GPUs; 0.7 OOMed).
 APPROVED_BATCH = {f"byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_{k}.yaml": dict(
     sglang_max_running_requests=256, sglang_server_concurrency=256, precompute_concurrency=4096,
-    **({} if k == "k1" else dict(sglang_mem_fraction_static=0.7))) for k in ("k1", "k40", "k120")}
+    **({} if k == "k1" else dict(sglang_mem_fraction_static=0.6))) for k in ("k1", "k40", "k120")}
 APPROVED_BATCH["byte16_qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k120.yaml"] = APPROVED_BATCH[
     "byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_k120.yaml"]
 

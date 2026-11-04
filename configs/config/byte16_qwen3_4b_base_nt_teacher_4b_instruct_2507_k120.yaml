@@ -43,7 +43,7 @@ actor_num_gpus_per_node: 4
 colocate: false
 rollout_num_gpus: 8
 rollout_num_gpus_per_engine: 1
-sglang_mem_fraction_static: 0.7
+sglang_mem_fraction_static: 0.6
 # Bound long-answer inference/evaluation and retain worker health checks.
 sglang_server_concurrency: 256
 sglang_max_running_requests: 256
