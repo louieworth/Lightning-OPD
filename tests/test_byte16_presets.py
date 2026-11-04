@@ -57,6 +57,14 @@ APPROVED_CONTEXT = {f"byte16_{pair}_{k}.yaml": {"sglang_context_length": 40960}
                     for k in ("k1", "k40", "k120")}
 
 
+# User-approved 11/04: larger engine batches for the 4B base pair (memory 0.7 on dedicated rollout GPUs).
+APPROVED_BATCH = {f"byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_{k}.yaml": dict(
+    sglang_max_running_requests=256, sglang_server_concurrency=256, precompute_concurrency=4096,
+    **({} if k == "k1" else dict(sglang_mem_fraction_static=0.7))) for k in ("k1", "k40", "k120")}
+APPROVED_BATCH["byte16_qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k120.yaml"] = APPROVED_BATCH[
+    "byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_k120.yaml"]
+
+
 def load(name):
     return yaml.safe_load((CONFIGS / name).read_text())
 
@@ -85,11 +93,13 @@ class Byte16PresetTests(unittest.TestCase):
             with self.subTest(config=name):
                 cfg, original = load(name), load(source(k))
                 changed = {key for key in cfg.keys() | original.keys() if cfg.get(key) != original.get(key)}
-                memory = dict(APPROVED_MEMORY.get(name, {}), **APPROVED_CONTEXT.get(name, {}))
+                memory = dict(APPROVED_MEMORY.get(name, {}), **APPROVED_CONTEXT.get(name, {}), **APPROVED_BATCH.get(name, {}))
                 k_blocks = {"policy_rollout_k"} if k == "k40" else set()
                 self.assertEqual(changed - PATHS_AND_LAYOUT - APPROVED_EVAL - set(APPROVED_THROUGHPUT) - set(memory) - k_blocks,
                                  set())
-                self.assertEqual({key: cfg[key] for key in APPROVED_THROUGHPUT}, APPROVED_THROUGHPUT)
+                expected = dict(APPROVED_THROUGHPUT, **{key: value for key, value in APPROVED_BATCH.get(name, {}).items()
+                                                        if key in APPROVED_THROUGHPUT})
+                self.assertEqual({key: cfg[key] for key in APPROVED_THROUGHPUT}, expected)
 
     def test_only_the_4_gpu_d_and_4b_actors_use_expandable_segments(self):
         for name, (_, k) in PRESETS.items():
