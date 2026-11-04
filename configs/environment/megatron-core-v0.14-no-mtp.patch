@@ -1,0 +1,21 @@
+diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
+index 6aec66e6d..686936ec3 100644
+--- a/megatron/core/models/gpt/gpt_model.py
++++ b/megatron/core/models/gpt/gpt_model.py
+@@ -355,6 +355,7 @@ class GPTModel(LanguageModule):
+         *,
+         inference_params: Optional[BaseInferenceContext] = None,
+         loss_mask: Optional[Tensor] = None,
++        mtp_kwargs: Optional[dict] = None,
+     ) -> Tensor:
+         """Forward function of the GPT Model This function passes the input tensors
+         through the embedding layer, and then the decoeder and finally into the post
+@@ -367,6 +368,8 @@ class GPTModel(LanguageModule):
+                 `parallel_output` arg in the constructor will be used.
+         """
+ 
++        if mtp_kwargs:
++            raise NotImplementedError("Megatron core 0.14 has no MTP forward arguments; only mtp_kwargs={} is accepted.")
+         inference_context = deprecate_inference_params(inference_context, inference_params)
+ 
+         decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (

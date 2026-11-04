@@ -74,7 +74,11 @@ def main():
         if checksum(archive) != SOURCE_SHA256:
             raise RuntimeError('TorchMemorySaver source archive failed SHA256 verification.')
         with tarfile.open(archive) as source:
-            source.extractall(build, filter='data')
+            # Python < 3.11.4 (e.g. Debian's 3.11.2) has no extraction filters; the archive is SHA256-pinned.
+            if hasattr(tarfile, 'data_filter'):
+                source.extractall(build, filter='data')
+            else:
+                source.extractall(build)
         package = build / ('torch_memory_saver-' + SOURCE_COMMIT)
         entrypoint = package / 'csrc/entrypoint.cpp'
         entrypoint.write_text(patched_source(entrypoint.read_text()))
@@ -83,7 +87,9 @@ def main():
                         '--no-build-isolation', '--force-reinstall', str(package)], check=True)
     package = metadata.distribution('torch-memory-saver')
     library = Path(package.locate_file('torch_memory_saver_hook_mode_preload.abi3.so')).resolve()
-    if not library.is_relative_to(Path(sys.prefix).resolve()):
+    import site
+    roots = [Path(sys.prefix).resolve(), Path(site.getusersitepackages()).resolve()]  # non-root hosts use --user
+    if not any(library.is_relative_to(root) for root in roots):
         raise RuntimeError('The patched TorchMemorySaver must be installed inside the image Python environment.')
     record = {'fix': FIX_NAME, 'version': package.version, 'source_sha256': SOURCE_SHA256,
               'base_commit': SOURCE_COMMIT, 'upstream_fix': UPSTREAM_FIX,
