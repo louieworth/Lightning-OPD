@@ -769,10 +769,16 @@ def check_dependencies(cfg, preparation=False):
         )
 
 
-def request(url, payload=None):
+# One request is a whole generation or scoring call, including its wait in SGLang's queue. With thousands of
+# block requests in flight against full KV caches, later ones queue for many minutes; 600 s failed the 4B base
+# K=1 block (11/04). A dead server still fails fast through its closed connection.
+REQUEST_TIMEOUT_S = 7200
+
+
+def request(url, payload=None, timeout=REQUEST_TIMEOUT_S):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=600) as response:
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as response:
         return json.loads(response.read() or b"{}")
 
 
