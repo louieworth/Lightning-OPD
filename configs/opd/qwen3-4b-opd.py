@@ -64,6 +64,8 @@ LAUNCHER_KEYS = {
     "teacher_mem_fraction_static",
     "teacher_context_length",
     "teacher_chunked_prefill_size",
+    "teacher_persistent",
+    "lightning_teacher_url",
     "teacher_url",
     "train_files",
     "source_data_dir",
@@ -146,8 +148,16 @@ def read_config(path, method, resume=False):
         lightning_blocks.schedule(cfg)
         if cfg["n_samples_per_prompt"] != 1 or cfg["rollout_batch_size"] != cfg["global_batch_size"]:
             raise ValueError("Block Lightning requires one response per prompt and rollout_batch_size == global_batch_size.")
-        if cfg["rollout_shuffle"] or not cfg["colocate"]:
-            raise ValueError("Block Lightning requires rollout_shuffle: false and colocate: true.")
+        if cfg["rollout_shuffle"]:
+            raise ValueError("Block Lightning requires rollout_shuffle: false.")
+        if lightning_blocks.resident(cfg):
+            # colocate: false keeps the actor, student engines and teacher on their own GPUs for the
+            # whole job (the K=120 layout), so blocks never offload, onload or restart anything.
+            if cfg["ray_cluster"] != "existing":
+                raise ValueError("Resident Block Lightning (colocate: false) requires ray_cluster: existing.")
+            if needs_teacher_features(cfg):
+                raise ValueError("Resident Block Lightning scores scalar teacher log-probs only; use colocate: true "
+                                 "for distribution losses.")
         if cfg.get("async_save") or cfg.get("update_weights_interval", 1) != 1 or cfg.get("use_critic"):
             raise ValueError("Block Lightning requires synchronous saves, update_weights_interval: 1 and no critic.")
     cfg.setdefault("save_model", "active")
@@ -166,12 +176,13 @@ def read_config(path, method, resume=False):
         cfg["save_interval"] = cfg["eval_steps"] * multiplier
     else:
         raise ValueError("save_model must be null (no saves), final, or active.")
-    if method == "opd" and not cfg.get("teacher_url") and cfg["teacher_num_gpus"] < 1:
+    live_teacher = (method == "opd" or lightning_blocks.resident(cfg)) and not cfg.get("teacher_url")
+    if live_teacher and cfg["teacher_num_gpus"] < 1:
         raise ValueError("A managed OPD teacher requires teacher_num_gpus > 0.")
     if cfg["max_train_samples"] is not None and cfg["max_train_samples"] < 1:
         raise ValueError("max_train_samples must be positive or null.")
     actor = cfg["actor_num_nodes"] * cfg["actor_num_gpus_per_node"]
-    teacher = cfg["teacher_num_gpus"] if method == "opd" and not cfg.get("teacher_url") else 0
+    teacher = cfg["teacher_num_gpus"] if live_teacher else 0
     total = cfg["nnodes"] * cfg["n_gpus_per_node"]
     rollout = actor if cfg["colocate"] else cfg["rollout_num_gpus"]
     if actor + (0 if cfg["colocate"] else rollout) + teacher > total:
@@ -1217,8 +1228,8 @@ def train_existing_cluster(cfg, student, teacher, env):
         prepare_head(cfg, student, teacher, env, env)
         if cfg["nnodes"] > 1:
             ray_job.mirror(checkpoint_path(cfg, student))
-            if cfg["method"] == "lightning_opd":  # Block scoring runs the teacher on every node.
-                ray_job.mirror(teacher)
+            if cfg["method"] == "lightning_opd" and not lightning_blocks.resident(cfg):
+                ray_job.mirror(teacher)  # Colocated block scoring runs the teacher on every node.
         public, secret = ray_job.split_secrets(env)
         workers = {key: value for key, value in public.items()
                    if key != "CUDA_VISIBLE_DEVICES" and not key.startswith("RAY_")}
@@ -1232,7 +1243,8 @@ def train_existing_cluster(cfg, student, teacher, env):
                                               "worker_process_setup_hook": "slime.utils.ray_job.load_worker_secrets"})
         with contextlib.ExitStack() as stack:
             teacher_url = cfg.get("teacher_url")
-            if cfg["method"] == "opd" and not teacher_url:
+            resident = lightning_blocks.resident(cfg)
+            if (cfg["method"] == "opd" or resident) and not teacher_url:
                 # The live teacher holds its GPUs through Ray on this node; only the rollout manager
                 # (also on this node) queries it, so loopback is enough.
                 stack.enter_context(ray_job.gpu_process(
@@ -1240,6 +1252,11 @@ def train_existing_cluster(cfg, student, teacher, env):
                                    cfg["teacher_mem_fraction_static"], True),
                     env, cfg["teacher_num_gpus"], {f"node:{node}": 0.001}, run_dir(cfg) / "teacher.log"))
                 teacher_url = f"http://127.0.0.1:{cfg['teacher_port']}/generate"
+            if resident:
+                # Block scoring (in train.py on this node) queries the live teacher; no reward-model URL.
+                cfg = dict(cfg, lightning_teacher_url=teacher_url.rsplit("/", 1)[0])
+                wait_ready(cfg["lightning_teacher_url"] + "/health_generate", cfg["startup_timeout"])
+                teacher_url = None
             run_training(cfg, student, teacher, env, teacher_url)
     finally:
         ray.shutdown()
@@ -1415,7 +1432,7 @@ def main(method="opd"):
                     "policy_blocks": lightning_blocks.schedule(cfg) if lightning_blocks.enabled(cfg) else None,
                     "nodes": cfg["nnodes"],
                     "gpus_per_node": cfg["n_gpus_per_node"],
-                    "teacher_gpus": cfg["teacher_num_gpus"] if method == "opd" else 0,
+                    "teacher_gpus": cfg["teacher_num_gpus"] if method == "opd" or lightning_blocks.resident(cfg) else 0,
                 },
                 sort_keys=False,
             )

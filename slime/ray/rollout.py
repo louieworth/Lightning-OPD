@@ -161,6 +161,24 @@ class RolloutManager:
 
         return load_training_block(self, index, rollout_id, policy_id)
 
+    def start_lightning_stream(self, index, policy_id):
+        from slime.rollout.lightning_opd_blocks import BlockStream
+
+        previous = getattr(self, "_lightning_stream", None)
+        if previous is not None:
+            previous.finish()
+        self._lightning_stream = BlockStream(self, index, policy_id).start()
+
+    def load_lightning_batch(self, index, rollout_id, policy_id):
+        from slime.rollout.lightning_opd_blocks import load_training_batch
+
+        return load_training_batch(self, index, rollout_id, policy_id)
+
+    def finish_lightning_stream(self):
+        stream = getattr(self, "_lightning_stream", None)
+        if stream is not None:
+            stream.finish()
+
     def offload(self):
         return ray.get([engine.release_memory_occupation.remote() for engine in self.rollout_engines])
 
@@ -415,6 +433,9 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
             "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+            # Lets --sglang-context-length exceed the HF config (Qwen3-1.7B-Base: 32768 < 4096 + 32768 eval);
+            # without that flag it changes nothing.
+            "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
         }
 
         worker_type = "regular"

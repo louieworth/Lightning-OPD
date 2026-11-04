@@ -73,6 +73,15 @@ class ExistingClusterConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ray_cluster"):
             self.read(single_node(ray_cluster="shared"))
 
+    def test_resident_lightning_counts_the_teacher_gpus_and_needs_the_existing_cluster(self):
+        resident = dict(nnodes=2, actor_num_nodes=1, actor_num_gpus_per_node=4, colocate=False,
+                        rollout_num_gpus=8, teacher_num_gpus=4, teacher_tp_size=4, policy_rollout_k=40)
+        self.assertFalse(self.read(single_node(**resident))["colocate"])
+        with self.assertRaisesRegex(ValueError, "GPU allocations"):
+            self.read(single_node(**dict(resident, rollout_num_gpus=12)))  # 4 + 12 + teacher 4 > 16
+        with self.assertRaisesRegex(ValueError, "ray_cluster: existing"):
+            self.read(single_node(**dict(resident, ray_cluster="managed")))
+
 
 class ConvertedCheckpointTests(unittest.TestCase):
     def test_experiments_with_the_same_student_share_one_conversion(self):
@@ -192,6 +201,42 @@ class ExistingClusterLaunchTests(unittest.TestCase):
         self.assertIn("teacher-model", command)
         self.assertEqual((gpus, resources), (cfg["teacher_num_gpus"], {f"node:{NODE}": 0.001}))
         self.assertEqual(train, ("train", f"http://127.0.0.1:{cfg['teacher_port']}/generate"))
+
+    def test_resident_lightning_holds_one_live_teacher_and_scores_blocks_through_it(self):
+        # User decision 11/03: Lightning with K > 10 keeps actor, engines and teacher on dedicated GPUs.
+        module = launcher()
+        events, mirrored = [], []
+
+        @contextlib.contextmanager
+        def gpu_process(command, env, num_gpus, resources, log_path):
+            events.append(("teacher up", command, num_gpus, resources))
+            yield
+            events.append(("teacher down",))
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "torch_dist"
+            checkpoint.mkdir()
+            (checkpoint / "latest_checkpointed_iteration.txt").write_text("release")
+            cfg = single_node(output_dir=directory, experiment_name="test", nnodes=2, actor_num_nodes=1,
+                              actor_num_gpus_per_node=4, colocate=False, rollout_num_gpus=8, teacher_num_gpus=4,
+                              teacher_tp_size=4, policy_rollout_k=40)
+            with patch.dict(sys.modules, {"ray": fake_ray(8.0)}), \
+                    patch.object(ray_job, "mirror", side_effect=lambda path, **kw: mirrored.append(Path(path))), \
+                    patch.object(ray_job, "missing_on_nodes", return_value=[]), \
+                    patch.object(ray_job, "gpu_process", gpu_process), patch.object(ray_job, "write_worker_secrets"), \
+                    patch.object(module, "check_training_storage"), patch.object(module, "check_inputs"), \
+                    patch.object(module, "check_run_state"), patch.object(module, "wait_ready"), \
+                    patch.object(module, "checkpoint_path", return_value=checkpoint), \
+                    patch.object(module, "run_training", side_effect=lambda cfg, s, t, env, url: events.append(
+                        ("train", url, cfg.get("lightning_teacher_url")))):
+                module.train_cluster(cfg, "student", "teacher-model", {"PATH": "/usr/bin"})
+        (up, command, gpus, resources), train, down = events
+        self.assertEqual((up, down), ("teacher up", ("teacher down",)))
+        self.assertIn("teacher-model", command)
+        self.assertEqual((gpus, resources), (4, {f"node:{NODE}": 0.001}))
+        # No reward-model URL: blocks score through lightning_teacher_url, recorded in the run's config.yaml.
+        self.assertEqual(train, ("train", None, f"http://127.0.0.1:{cfg['teacher_port']}"))
+        self.assertEqual(mirrored, [ROOT, checkpoint])  # the teacher stays on this node only
 
     def test_two_node_job_needs_free_gpus_on_every_node(self):
         with self.assertRaisesRegex(RuntimeError, "free GPUs"):

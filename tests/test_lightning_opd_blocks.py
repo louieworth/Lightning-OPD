@@ -161,7 +161,7 @@ class BlockTests(unittest.TestCase):
         constants = types.SimpleNamespace(GPU_MEMORY_TYPE_WEIGHTS="weights", GPU_MEMORY_TYPE_KV_CACHE="kv")
         with patch.dict(sys.modules, {"ray": types.SimpleNamespace(get=lambda value: value),
                                       "sglang.srt.constants": constants}), \
-                patch.object(blocks, "score_teacher_block", lambda *values: scored.append(values[1:])):
+                patch.object(blocks, "score_teacher_block", lambda *values: scored.append(values[1:3])):
             blocks.BlockCoordinator(args, manager).ensure_block(3)
         self.assertEqual(prepared, [(1, "saved-policy")])
         self.assertEqual(scored, [(1, "saved-policy")])
@@ -324,6 +324,188 @@ class BlockTests(unittest.TestCase):
         rows = pq.read_table(blocks.block_paths(self.cfg, 0)[1]).to_pylist()
         self.assertEqual([row["metadata"]["lightning_sample_index"] for row in rows], list(range(6)))
         self.assertTrue(all(row["metadata"]["teacher_log_probs"] == [-.2] for row in rows))
+
+    def persistent_scoring(self, fail_block=None, **cfg):
+        """Score blocks 0 and 1 through one TeacherServers; return (calls by endpoint, stops, servers)."""
+        self.cfg.update(nnodes=2, n_gpus_per_node=4, teacher_tp_size=2, precompute_port=7000, **cfg)
+        blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+        args = self.snapshot()
+        manager = types.SimpleNamespace(args=args)
+        calls, stops, ready = [], [], []
+
+        @contextlib.contextmanager
+        def gpu_process(command, env, num_gpus, resources, log_path, devices=None):
+            self.launched.append((command, num_gpus, resources, devices))
+            try:
+                yield types.SimpleNamespace(poll=lambda: None, returncode=None)
+            finally:
+                stops.append(command[1])
+
+        def request(url, payload):
+            endpoint = url.rsplit("/", 1)[1]
+            if endpoint != "generate":
+                calls.append(endpoint)
+                return {}
+            if payload["sampling_params"]["max_new_tokens"]:
+                return dict(meta_info=dict(output_token_logprobs=[[-.5, 100, ""]], finish_reason={"type": "stop"}))
+            if scoring["block"] == fail_block:
+                raise OSError("teacher server died")
+            ids = payload["input_ids"]
+            return dict(meta_info=dict(input_token_logprobs=[[None, ids[0], ""]] + [[-.2, t, ""] for t in ids[1:]]))
+
+        launcher = types.SimpleNamespace(
+            request=request, wait_ready=lambda url, timeout, process=None: ready.append(url),
+            server_command=lambda cfg, model, port, tp, memory, scoring, host: [model, port, tp, scoring, host])
+        transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()),
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **kw: types.SimpleNamespace(vocab_size=151936)))
+        scoring = dict(block=None)
+        servers = blocks.TeacherServers(self.cfg, self.models, self.root / "servers")
+        with patch.dict(sys.modules, {"configs.opd.qwen3-4b-opd": launcher, "transformers": transformers}), \
+                patch.object(ray_job, "gpu_process", gpu_process), \
+                patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,5,6,7"}):
+            for index, policy in ((0, "initial"), (1, "updated")):
+                blocks.prepare_student_block(manager, index, policy)
+                scoring["block"] = index
+                calls.append(f"score {index}")
+                blocks.score_teacher_block(args, index, policy, servers)
+        return calls, stops, ready, servers
+
+    def test_persistent_teacher_starts_once_and_hands_gpus_back_between_blocks(self):
+        # K=40 started 8 fresh teacher servers per block on idle GPUs; the 1103 job was reclaimed for low SM use.
+        calls, stops, ready, servers = self.persistent_scoring()
+        self.assertEqual(len(self.launched), 4)  # 2 nodes x 4 GPUs / TP2, started once for both blocks
+        self.assertTrue(all(command[-2:] == ["--enable-memory-saver", "--enable-weights-cpu-backup"]
+                            for command, *_ in self.launched))
+        self.assertEqual(calls, ["score 0"] + ["release_memory_occupation"] * 4
+                         + ["score 1"] + ["resume_memory_occupation"] * 4 + ["release_memory_occupation"] * 4)
+        self.assertEqual(len(ready), 8)  # health-checked again after resuming
+        self.assertEqual(stops, [])
+        servers.close()
+        self.assertEqual(sorted(stops), [7000, 7000, 7001, 7001])
+        for index in (0, 1):
+            rows = pq.read_table(blocks.block_paths(self.cfg, index)[1]).to_pylist()
+            self.assertTrue(all(row["metadata"]["teacher_log_probs"] == [-.2] for row in rows))
+
+    def test_ephemeral_teacher_restarts_every_block_without_memory_saver(self):
+        calls, stops, _, _ = self.persistent_scoring(teacher_persistent=False)
+        self.assertEqual(len(self.launched), 8)
+        self.assertTrue(all("--enable-memory-saver" not in command for command, *_ in self.launched))
+        self.assertEqual(calls, ["score 0", "score 1"])
+        self.assertEqual(len(stops), 8)
+
+    def test_failed_scoring_stops_the_persistent_teacher(self):
+        with self.assertRaises(OSError):
+            self.persistent_scoring(fail_block=1)
+        self.assertEqual(len(self.launched), 4)
+
+    def test_resident_scoring_uses_only_the_launchers_live_teacher(self):
+        calls, stops, ready, servers = self.persistent_scoring(colocate=False,
+                                                               lightning_teacher_url="http://127.0.0.1:13141")
+        self.assertEqual(self.launched, [])  # nothing started, released, resumed or stopped
+        self.assertEqual((calls, stops), (["score 0", "score 1"], []))
+        self.assertEqual(ready, ["http://127.0.0.1:13141/health_generate"] * 2)
+        servers.close()
+        self.assertEqual(stops, [])
+
+    def test_resident_coordinator_streams_each_block_and_never_moves_model_memory(self):
+        # User decision 11/03: K > 10 keeps the actor, engines and teacher loaded on dedicated GPUs, and each
+        # step waits only for its own fixed-position batch of the streaming block.
+        self.cfg.update(colocate=False, lightning_teacher_url="http://127.0.0.1:13141")
+        blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+        args = self.snapshot()
+        args.__dict__.update(offload_train=False, offload_rollout=False, update_weights_interval=1, start_rollout_id=0)
+        events = []
+        manager = types.SimpleNamespace(
+            start_lightning_stream=Remote(lambda *values: events.append(("stream",) + values)),
+            load_lightning_batch=Remote(lambda *values: events.append(("batch",) + values)),
+            finish_lightning_stream=Remote(lambda: events.append(("finish",))),
+            offload=Remote(lambda: events.append(("offload",))),
+            onload=Remote(lambda **kwargs: events.append(("onload",))),
+        )
+        with patch.dict(sys.modules, {"ray": types.SimpleNamespace(get=lambda value: value)}):
+            coordinator = blocks.BlockCoordinator(args, manager)
+            for step in range(6):
+                coordinator.ensure_block(step)
+                if blocks.engines_needed_after(coordinator.blocks, step, False):
+                    coordinator.settle()
+        lineage = coordinator.lineage
+        self.assertEqual(events, [("stream", 0, "initial")] + [("batch", 0, step, "initial") for step in range(3)]
+                         + [("finish",), ("stream", 1, lineage)]
+                         + [("batch", 1, step, lineage) for step in range(3, 6)])  # the final save settles it
+        args.offload_rollout = True
+        with self.assertRaisesRegex(ValueError, "Resident"):
+            blocks.BlockCoordinator(args, manager)
+
+    def stream_fakes(self, gate=None, fail_at=None):
+        """Launcher/transformers stand-ins: the student answers [100 + position], the teacher -0.01 * token."""
+        def request(url, payload):
+            if payload["sampling_params"]["max_new_tokens"]:  # student generation through the router
+                position = payload["sampling_params"]["sampling_seed"] - self.cfg["seed"]
+                if gate is not None and position >= self.cfg["rollout_batch_size"]:
+                    assert gate.wait(10), "later batches never released"
+                return dict(meta_info=dict(output_token_logprobs=[[-.5, 100 + position, ""]],
+                                           finish_reason={"type": "stop"}))
+            ids = payload["input_ids"]
+            if fail_at is not None and ids[-1] == 100 + fail_at:
+                raise OSError("teacher server died")
+            return dict(meta_info=dict(input_token_logprobs=[[None, ids[0], ""]] + [[-.01 * t, t, ""] for t in ids[1:]]))
+
+        launcher = types.SimpleNamespace(
+            request=request, wait_ready=lambda url, timeout, process=None: None,
+            server_command=lambda *a: [])
+        transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: Tokenizer()),
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **kw: types.SimpleNamespace(vocab_size=151936)))
+        return patch.dict(sys.modules, {"configs.opd.qwen3-4b-opd": launcher, "transformers": transformers})
+
+    def test_streamed_block_trains_its_first_batch_while_later_rows_generate(self):
+        import threading
+
+        self.cfg.update(colocate=False, lightning_teacher_url="http://127.0.0.1:13141")
+        blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+        args = self.snapshot()
+        manager = types.SimpleNamespace(args=args)
+        gate = threading.Event()
+        with self.stream_fakes(gate):
+            stream = blocks.BlockStream(manager, 0, "policy").start()
+            first = pq.read_table(stream.wait(0)).to_pylist()
+            self.assertFalse(stream.ready[1].is_set())  # batch 1 still generating: step 0 can train now
+            gate.set()
+            stream.finish()
+        self.assertEqual([row["metadata"]["lightning_sample_index"] for row in first], [0, 1])
+        self.assertEqual([row["metadata"]["teacher_log_probs"] for row in first], [[-1.0], [-1.01]])
+        streamed = {name: pq.read_table(path).to_pylist() for name, path in zip(("rollouts", "scored"),
+                                                                              blocks.block_paths(self.cfg, 0))}
+        # The unstreamed path on the same policy writes exactly the same block files.
+        reference = dict(self.cfg, experiment_name="reference")
+        blocks.run_directory(reference).mkdir()
+        blocks.atomic_json(blocks.run_directory(reference) / "initialization.json", self.models)
+        blocks.prepare_fixed_prompts(reference, "student", Tokenizer())
+        self.cfg = reference
+        reference_args = self.snapshot()
+        with self.stream_fakes():
+            blocks.prepare_student_block(types.SimpleNamespace(args=reference_args), 0, "policy")
+            blocks.score_teacher_block(reference_args, 0, "policy",
+                                       blocks.TeacherServers(reference, self.models, self.root / "unused"))
+        for name, path in zip(("rollouts", "scored"), blocks.block_paths(reference, 0)):
+            self.assertEqual(pq.read_table(path).to_pylist(), streamed[name])
+        # A resumed job finds the block complete under its policy identity.
+        identity = blocks.block_identity(self.cfg, self.models, 0, "policy")
+        self.assertTrue(blocks.cached(blocks.block_paths(reference, 0)[1], blocks.teacher_identity(reference, identity), 6))
+
+    def test_streamed_block_failure_reaches_the_waiting_step_and_writes_no_block_file(self):
+        self.cfg.update(colocate=False, lightning_teacher_url="http://127.0.0.1:13141")
+        blocks.prepare_fixed_prompts(self.cfg, "student", Tokenizer())
+        manager = types.SimpleNamespace(args=self.snapshot())
+        with self.stream_fakes(fail_at=3):
+            stream = blocks.BlockStream(manager, 0, "policy").start()
+            self.assertEqual(len(pq.read_table(stream.wait(0))), 2)
+            with self.assertRaisesRegex(RuntimeError, "before batch 1"):
+                stream.wait(1)
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                stream.finish()
+        self.assertFalse(blocks.block_paths(self.cfg, 0)[1].exists())
 
     def test_scoring_servers_fill_each_node_in_teacher_tp_groups(self):
         cfg = dict(self.cfg, n_gpus_per_node=8, teacher_tp_size=4, precompute_port=7000)
@@ -593,7 +775,7 @@ class BlockTests(unittest.TestCase):
                                               onload=lambda: state.update(train_loaded=True), offload=offload,
                                               dispose=lambda: None)
 
-                def score(args, index, policy):
+                def score(args, index, policy, servers=None):
                     self.assertFalse(state["train_loaded"])
                     self.assertFalse(state["inference_loaded"])
                     stage("teacher", index)
@@ -696,7 +878,7 @@ class BlockTests(unittest.TestCase):
                         eval=Remote(lambda index, completed_steps: event("eval", completed_steps)),
                         save=Remote(lambda index: event("cursor", index)), dispose=Remote(lambda: event("dispose")),
                     )
-                    coordinator = types.SimpleNamespace(ensure_block=lambda index: None, blocks=blocks.schedule(
+                    coordinator = types.SimpleNamespace(ensure_block=lambda index: None, close=lambda: None, settle=lambda: None, blocks=blocks.schedule(
                         dict(num_rollout=6, rollout_batch_size=2, policy_rollout_k=1)))
                     ray = types.SimpleNamespace(get=lambda value: value)
                     namespace = dict(ray=ray, GPU_MEMORY_TYPE_WEIGHTS="weights", GPU_MEMORY_TYPE_KV_CACHE="kv",
@@ -743,6 +925,7 @@ class BlockTests(unittest.TestCase):
             offload=Remote(lambda: events.append(("engines_off", None))),
             onload=Remote(lambda tags=None: events.append(("engines_on", tags))))
         coordinator = types.SimpleNamespace(ensure_block=lambda index: events.append(("ensure_block", index)),
+                                            close=lambda: None, settle=lambda: events.append(("settle", None)),
                                             blocks=blocks.schedule(dict(num_rollout=6, rollout_batch_size=2, policy_rollout_k=2)))
         namespace = dict(ray=types.SimpleNamespace(get=lambda value: value), GPU_MEMORY_TYPE_WEIGHTS="weights",
                          GPU_MEMORY_TYPE_KV_CACHE="kv", GPU_MEMORY_TYPE_CUDA_GRAPH="graph", configure_logger=lambda: None,

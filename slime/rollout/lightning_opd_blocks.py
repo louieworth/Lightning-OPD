@@ -24,9 +24,9 @@ from slime.utils.opd_config import needs_teacher_features
 ROW_GROUP = 1024  # Parquet row group size and progress-report granularity.
 
 
-def ordered_groups(function, rows, concurrency):
+def ordered_groups(function, rows, concurrency, size=ROW_GROUP):
     """Apply `function` to every row with up to `concurrency` calls in flight; yield results in row order,
-    ROW_GROUP at a time. A finished call frees its slot for the next row at once, so no row group waits
+    `size` (default ROW_GROUP) at a time. A finished call frees its slot for the next row at once, so no row group waits
     for its slowest row (block generation is long-tailed). Queued calls are cancelled on failure.
     """
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
@@ -34,7 +34,7 @@ def ordered_groups(function, rows, concurrency):
         group = []
         for result in pool.map(function, rows):
             group.append(result)
-            if len(group) == ROW_GROUP:
+            if len(group) == size:
                 yield group
                 group = []
         if group:
@@ -45,6 +45,15 @@ def ordered_groups(function, rows, concurrency):
 
 def enabled(cfg):
     return cfg.get("method") == "lightning_opd" and "policy_rollout_k" in cfg
+
+
+def resident(cfg):
+    """Block Lightning on dedicated actor / student-engine / teacher GPUs (colocate: false).
+
+    Everything stays loaded for the whole job: blocks never offload, onload or restart a model. The
+    launcher starts one live teacher on its own GPUs and records its URL as lightning_teacher_url.
+    """
+    return enabled(cfg) and not cfg.get("colocate", True)
 
 
 def schedule(cfg):
@@ -314,9 +323,27 @@ def prepare_student_block(manager, index, policy_id):
         copy_block(shared, rollouts, identity)
         print(f"Policy rollout {index + 1}: reusing the initial student's responses from {shared.parent}.", flush=True)
         return
+    table = fixed_block_rows(manager, cfg, block)
+    generate = student_generator(args, cfg, index, block)
+    print(f"Policy rollout {index + 1}/{cfg['policy_rollout_k']}: policy after step {block['start_step']}, {count:,} samples.", flush=True)
+    write_batches(rollouts, ordered_groups(generate, table, cfg["precompute_concurrency"]), identity, count)
+    if shared is not None:
+        copy_block(rollouts, shared, shared_identity)
+
+
+def fixed_block_rows(manager, cfg, block):
+    """The block's fixed prompt rows, in absolute position order."""
+    import pyarrow.parquet as pq
+
     if not hasattr(manager, "_lightning_fixed_table"):
         manager._lightning_fixed_table = pq.read_table(fixed_data(cfg))
-    table = manager._lightning_fixed_table.slice(block["start_sample"], count)
+    return manager._lightning_fixed_table.slice(block["start_sample"], block["end_sample"] - block["start_sample"]).to_pylist()
+
+
+def student_generator(args, cfg, index, block):
+    """row -> the row with the current student's response, sampled with the row's fixed position seed."""
+    from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
     launcher = importlib.import_module("configs.opd.qwen3-4b-opd")
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
@@ -340,10 +367,7 @@ def prepare_student_block(manager, index, policy_id):
                         loss_mask=[1] * len(tokens), response=tokenizer.decode(tokens, skip_special_tokens=False))
         return dict(prompt=row["prompt"], label=row["label"], metadata=metadata)
 
-    print(f"Policy rollout {index + 1}/{cfg['policy_rollout_k']}: policy after step {block['start_step']}, {count:,} samples.", flush=True)
-    write_batches(rollouts, ordered_groups(generate, table.to_pylist(), cfg["precompute_concurrency"]), identity, count)
-    if shared is not None:
-        copy_block(rollouts, shared, shared_identity)
+    return generate
 
 
 def teacher_response_logprobs(output, tokens, sglang_vocab_size=None):
@@ -390,8 +414,85 @@ def scoring_servers(cfg, nodes, visible=None):
             for node in nodes for first in range(0, per_node, tp)]
 
 
-def score_teacher_block(args, index, policy_id):
-    """Score a block's cached student rollouts with the teacher on every GPU of the job (see scoring_servers)."""
+class TeacherServers:
+    """The teacher scoring servers of a job (see scoring_servers), started on first use.
+
+    Persistent (the default for log-prob scoring): the servers start once with SGLang's memory saver
+    and a CPU copy of the weights, and between blocks only release their GPU memory to the student
+    and trainer, so each later block resumes them in seconds instead of starting K new servers (loading
+    the teacher and capturing CUDA graphs on every GPU while the GPUs otherwise sit idle).
+    Otherwise, or for feature scoring (slime.rollout.opd_teacher has no memory saver), the servers are
+    stopped after every block, as before.
+    """
+
+    def __init__(self, cfg, models, log_dir):
+        self.cfg, self.models, self.log_dir = cfg, models, Path(log_dir)
+        self.persistent = bool(cfg.get("teacher_persistent", True)) and not needs_teacher_features(cfg)
+        # Resident jobs: the launcher owns one live teacher on dedicated GPUs; never start, release or stop it.
+        self.external = cfg.get("lightning_teacher_url")
+        self.stack, self.urls, self.processes, self.released = None, [], [], False
+
+    @property
+    def launcher(self):
+        return importlib.import_module("configs.opd.qwen3-4b-opd")
+
+    def acquire(self):
+        """Return the ready servers' base URLs, starting or resuming them as needed."""
+        if self.external:
+            self.launcher.wait_ready(self.external + "/health_generate", self.cfg["startup_timeout"])
+            return [self.external]
+        if self.stack is None:
+            self._start()
+        elif self.released:
+            for url in self.urls:
+                self.launcher.request(url + "/resume_memory_occupation", {})
+            self.released = False
+        for url, process in zip(self.urls, self.processes, strict=True):
+            self.launcher.wait_ready(url + "/health_generate", self.cfg["startup_timeout"], process)
+        return self.urls
+
+    def release(self):
+        """Hand every GPU back after a block's scoring."""
+        if self.stack is None or self.external:
+            return
+        if not self.persistent:
+            self.close()
+            return
+        for url in self.urls:
+            self.launcher.request(url + "/release_memory_occupation", {})
+        self.released = True
+
+    def close(self):
+        stack, self.stack, self.urls, self.processes, self.released = self.stack, None, [], [], False
+        if stack is not None:
+            stack.close()
+
+    def _start(self):
+        cfg = self.cfg
+        servers = scoring_servers(cfg, ray_job.gpu_nodes(cfg["nnodes"]), os.environ.get("CUDA_VISIBLE_DEVICES"))
+        stack = contextlib.ExitStack()
+        try:
+            # Start every server before waiting for any, so they load the teacher at the same time.
+            for node, devices, port in servers:
+                command = self.launcher.server_command(cfg, self.models["teacher"], port, cfg["teacher_tp_size"],
+                                                       cfg["teacher_mem_fraction_static"], True, node.strip("[]"))
+                if self.persistent:
+                    command += ["--enable-memory-saver", "--enable-weights-cpu-backup"]
+                self.processes.append(stack.enter_context(ray_job.gpu_process(
+                    command, None, 0, {f"node:{node}": 0.001}, self.log_dir / f"teacher-{port}.log", devices)))
+                self.urls.append(f"http://{node}:{port}")
+        except BaseException:
+            stack.close()
+            self.urls, self.processes = [], []
+            raise
+        self.stack = stack
+
+
+def score_teacher_block(args, index, policy_id, servers=None):
+    """Score a block's cached student rollouts with the teacher on every GPU of the job (see scoring_servers).
+
+    `servers` (a TeacherServers) keeps the teacher alive across blocks; None starts and stops it here.
+    """
     import pyarrow.parquet as pq
     from transformers import AutoConfig, AutoTokenizer
 
@@ -408,6 +509,33 @@ def score_teacher_block(args, index, policy_id):
             rollouts = scored
         else:
             raise ValueError("Student block cache is incomplete or belongs to another policy.")
+    owned = servers is None
+    if owned:
+        servers = TeacherServers(dict(cfg, teacher_persistent=False), models, scored.parent)
+    urls = []
+    score = teacher_scorer(args, cfg, models, index, urls)
+
+    def batches():
+        rows = [row for batch in pq.ParquetFile(rollouts).iter_batches(batch_size=ROW_GROUP) for row in batch.to_pylist()]
+        yield from ordered_groups(score, list(enumerate(rows)), cfg["precompute_concurrency"])
+
+    try:
+        urls[:] = servers.acquire()
+        write_batches(scored, batches(), teacher_identity(cfg, identity), count)
+    except BaseException:
+        servers.close()  # A failed block never leaves servers holding GPUs for the next attempt.
+        raise
+    finally:
+        if owned:
+            servers.close()
+        else:
+            servers.release()
+
+
+def teacher_scorer(args, cfg, models, index, urls):
+    """(position, row) -> the row with its teacher log-probs; position picks a server from `urls` (read per call)."""
+    from transformers import AutoConfig, AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
     teacher_tokenizer = AutoTokenizer.from_pretrained(models["teacher"], trust_remote_code=True)
     if tokenizer.get_vocab() != teacher_tokenizer.get_vocab():
@@ -417,8 +545,6 @@ def score_teacher_block(args, index, policy_id):
     sglang_vocab_size = None if needs_teacher_features(cfg) else AutoConfig.from_pretrained(
         models["teacher"], trust_remote_code=True).vocab_size
     launcher = importlib.import_module("configs.opd.qwen3-4b-opd")
-    servers = scoring_servers(cfg, ray_job.gpu_nodes(cfg["nnodes"]), os.environ.get("CUDA_VISIBLE_DEVICES"))
-    urls = [f"http://{node}:{port}" for node, _, port in servers]
 
     def score(item):
         position, row = item
@@ -436,26 +562,10 @@ def score_teacher_block(args, index, policy_id):
             row["metadata"]["teacher_features"] = output["meta_info"]["opd_teacher_features"]
         return row
 
-    def batches():
-        rows = [row for batch in pq.ParquetFile(rollouts).iter_batches(batch_size=ROW_GROUP) for row in batch.to_pylist()]
-        yield from ordered_groups(score, list(enumerate(rows)), cfg["precompute_concurrency"])
-
-    with contextlib.ExitStack() as stack:
-        # Start every server before waiting for any, so they load the teacher at the same time.
-        processes = [stack.enter_context(ray_job.gpu_process(
-            launcher.server_command(cfg, models["teacher"], port, cfg["teacher_tp_size"],
-                                    cfg["teacher_mem_fraction_static"], True, node.strip("[]")),
-            None, 0, {f"node:{node}": 0.001}, scored.parent / f"teacher-{port}.log", devices))
-            for node, devices, port in servers]
-        for url, process in zip(urls, processes, strict=True):
-            launcher.wait_ready(url + "/health_generate", cfg["startup_timeout"], process)
-        write_batches(scored, batches(), teacher_identity(cfg, identity), count)
+    return score
 
 
 def load_training_block(manager, index, rollout_id, policy_id):
-    from slime.utils.data import create_dataset
-    from slime.utils.processing_utils import load_processor, load_tokenizer
-
     args = manager.args
     cfg, models = recipe(args)
     block = schedule(cfg)[index]
@@ -463,6 +573,17 @@ def load_training_block(manager, index, rollout_id, policy_id):
     path = block_paths(cfg, index)[1]
     if not cached(path, teacher_identity(cfg, block_identity(cfg, models, index, policy_id)), count):
         raise ValueError("Cannot train on an incomplete or stale-policy Lightning block.")
+    load_rows(manager, cfg, path, index, rollout_id, policy_id, block["start_sample"], count,
+              (rollout_id - block["start_step"]) * cfg["rollout_batch_size"])
+
+
+def load_rows(manager, cfg, path, index, rollout_id, policy_id, first_sample, count, offset):
+    """Make the parquet rows at absolute positions [first_sample, first_sample + count) the training data,
+    with the cursor `offset` rows in (the next rows are those of `rollout_id`)."""
+    from slime.utils.data import create_dataset
+    from slime.utils.processing_utils import load_processor, load_tokenizer
+
+    args = manager.args
     source = manager.data_source
     source.dataset = create_dataset(
         str(path), tokenizer=load_tokenizer(args.hf_checkpoint, trust_remote_code=True),
@@ -473,20 +594,142 @@ def load_training_block(manager, index, rollout_id, policy_id):
     )
     if len(source.dataset) != count:
         raise ValueError("Block loading filtered samples; the fixed global data positions would change.")
-    for offset, sample in enumerate(source.dataset.samples):
+    for position, sample in enumerate(source.dataset.samples):
         metadata = sample.metadata or {}
         tokens, logprobs = metadata.get("response_tokens"), metadata.get("teacher_log_probs")
         if (
-            metadata.get("lightning_sample_index") != block["start_sample"] + offset
+            metadata.get("lightning_sample_index") != first_sample + position
             or tokens is None or not len(tokens) or logprobs is None or len(tokens) != len(logprobs)
         ):
             raise ValueError("Lightning block has reordered rows or misaligned response/teacher logprobs.")
-    source.sample_offset = (rollout_id - block["start_step"]) * cfg["rollout_batch_size"]
+    source.sample_offset = offset
     source.sample_group_index = rollout_id * cfg["rollout_batch_size"]
     source.sample_index = source.sample_group_index
     source.epoch_id = 0
     source.metadata.update(lightning_block_index=index, lightning_policy_id=policy_id,
                            lightning_global_sample_offset=rollout_id * cfg["rollout_batch_size"])
+
+
+class BlockStream:
+    """Resident Block Lightning: generate, score and hand out one block batch by batch.
+
+    A background thread (in the rollout manager) sends every fixed position of the block to the student
+    engines, which hold the block-start policy until the stream is finished, and each finished response
+    straight to the resident teacher. Batch k, the block's k-th rollout_batch_size fixed positions, is
+    ready once all of its rows are scored, so training on it overlaps the generation of later batches.
+    Data, order and policy are exactly those of the unstreamed block (a batch never takes whichever rows
+    finish first: that would train short responses first). The block files are written when all rows are
+    done, so resuming and caching work as before.
+    """
+
+    def __init__(self, manager, index, policy_id):
+        import threading
+
+        self.manager, self.index, self.policy_id = manager, index, policy_id
+        self.cfg, self.models = recipe(manager.args)
+        self.block = schedule(self.cfg)[index]
+        self.batch = self.cfg["rollout_batch_size"]
+        self.count = self.block["end_sample"] - self.block["start_sample"]
+        self.identity = block_identity(self.cfg, self.models, index, policy_id)
+        self.rollouts, self.scored = block_paths(self.cfg, index)
+        self.paths = [None] * (self.count // self.batch)
+        self.ready = [threading.Event() for _ in self.paths]
+        self.error = None
+        self.thread = threading.Thread(target=self._run, name=f"lightning-block-{index}", daemon=True)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def wait(self, k):
+        """Path of batch k's scored rows, once they are all ready."""
+        self.ready[k].wait()
+        if self.paths[k] is None:
+            raise RuntimeError(f"Lightning block {self.index} stopped before batch {k} was ready.") from self.error
+        return self.paths[k]
+
+    def finish(self):
+        """Wait until every row is generated, scored and the block files are written."""
+        self.thread.join()
+        if self.error is not None:
+            raise RuntimeError(f"Lightning block {self.index} failed.") from self.error
+
+    def _publish(self, k, rows):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        path = self.scored.parent / "stream" / f"batch_{k:03d}.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp.parquet")
+        table = pa.Table.from_pylist(rows)
+        pq.write_table(table.replace_schema_metadata(identity_metadata(self.identity)), temporary, compression="zstd")
+        temporary.replace(path)
+        self.paths[k] = path
+        self.ready[k].set()
+
+    def _run(self):
+        import pyarrow.parquet as pq
+
+        try:
+            cfg, identity, count, args = self.cfg, self.identity, self.count, self.manager.args
+            scored_identity = teacher_identity(cfg, identity)
+            if cached(self.scored, scored_identity, count):
+                rows = pq.read_table(self.scored).to_pylist()
+                for k in range(len(self.paths)):
+                    self._publish(k, rows[k * self.batch:(k + 1) * self.batch])
+                return
+            shared, shared_identity = (shared_rollouts(cfg, identity) if self.policy_id == "initial"
+                                       else (None, None))
+            generate = None
+            if cached(self.rollouts, identity, count):
+                rows = pq.read_table(self.rollouts).to_pylist()
+            elif shared is not None and cached(shared, shared_identity, count):
+                copy_block(shared, self.rollouts, identity)
+                rows = pq.read_table(self.rollouts).to_pylist()
+                print(f"Policy rollout {self.index + 1}: reusing the initial student's responses "
+                      f"from {shared.parent}.", flush=True)
+            else:
+                rows = fixed_block_rows(self.manager, cfg, self.block)
+                generate = student_generator(args, cfg, self.index, self.block)
+                print(f"Policy rollout {self.index + 1}/{cfg['policy_rollout_k']}: policy after step "
+                      f"{self.block['start_step']}, {count:,} samples, streamed to the teacher.", flush=True)
+            score = teacher_scorer(args, cfg, self.models, self.index, [cfg["lightning_teacher_url"]])
+
+            def work(item):
+                position, row = item
+                if generate is not None:
+                    row = generate(row)
+                student = dict(row, metadata=dict(row["metadata"]))  # scoring adds teacher_log_probs in place
+                return student, score((position, row))
+
+            students, scored = [], []
+            groups = ordered_groups(work, list(enumerate(rows)), cfg["precompute_concurrency"], self.batch)
+            for k, group in enumerate(groups):
+                students += [student for student, _ in group]
+                scored += [row for _, row in group]
+                self._publish(k, [row for _, row in group])
+            if generate is not None:
+                write_batches(self.rollouts, [students], identity, count)
+                if shared is not None:
+                    copy_block(self.rollouts, shared, shared_identity)
+            write_batches(self.scored, [scored], scored_identity, count)
+        except BaseException as error:
+            self.error = error
+        finally:
+            for event in self.ready:
+                event.set()
+
+
+def load_training_batch(manager, index, rollout_id, policy_id):
+    """Train step `rollout_id` on its batch of the streaming block, waiting until the batch is scored."""
+    stream = getattr(manager, "_lightning_stream", None)
+    if stream is None or (stream.index, stream.policy_id) != (index, policy_id):
+        raise ValueError(f"No streaming Lightning block {index} for policy {policy_id}.")
+    cfg, block = stream.cfg, stream.block
+    k = rollout_id - block["start_step"]
+    path = stream.wait(k)
+    load_rows(manager, cfg, path, index, rollout_id, policy_id, block["start_sample"] + k * stream.batch,
+              stream.batch, 0)
 
 
 def generate_cached_rollout(args, rollout_id, data_source, evaluation=False):
@@ -520,37 +763,56 @@ class BlockCoordinator:
 
         self.ray, self.args, self.manager = ray, args, rollout_manager
         self.cfg, self.models = recipe(args)
-        if not args.offload_train or not args.offload_rollout or args.update_weights_interval != 1:
-            raise ValueError("Block Lightning requires offloaded training/inference and weight sync every step.")
+        self.resident = resident(self.cfg)
+        if args.update_weights_interval != 1:
+            raise ValueError("Block Lightning requires weight sync every step.")
+        if self.resident:
+            if args.offload_train or args.offload_rollout or not self.cfg.get("lightning_teacher_url"):
+                raise ValueError("Resident Block Lightning keeps every model loaded and needs the launcher's teacher.")
+        elif not args.offload_train or not args.offload_rollout:
+            raise ValueError("Colocated Block Lightning requires offloaded training/inference.")
         self.blocks = schedule(self.cfg)
-        self.loaded = None
+        self.loaded, self.streaming = None, None
+        self.teacher = TeacherServers(self.cfg, self.models, run_directory(self.cfg) / "data/teacher_servers")
         # Unsaved policy paths need a fresh lineage. Saved block-boundary policies
         # can reuse a complete cache tied to the exact checkpoint being restored.
         self.lineage = uuid.uuid4().hex
 
+    def resume_policy(self, index, rollout_id):
+        metadata = self.ray.get(self.manager.lightning_resume_metadata.remote())
+        policy_id = metadata.get("lightning_policy_id")
+        if (metadata.get("lightning_block_index") != index or not policy_id
+                or metadata.get("lightning_global_sample_offset") != rollout_id * self.cfg["rollout_batch_size"]):
+            raise ValueError("Block Lightning resume cursor does not match its cached policy block.")
+        return policy_id
+
+    def boundary_policy(self, index, rollout_id):
+        if index == 0:
+            return "initial"
+        return boundary_policy_id(self.args, self.cfg, self.models, index, rollout_id, self.lineage)
+
     def ensure_block(self, rollout_id):
+        """Make step `rollout_id`'s batch the rollout manager's training data."""
+        block = next(item for item in self.blocks if item["start_step"] <= rollout_id < item["end_step"])
+        if self.resident:
+            return self.ensure_resident_batch(block, rollout_id)
         from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-        block = next(item for item in self.blocks if item["start_step"] <= rollout_id < item["end_step"])
         index = block["index"]
         if self.loaded == index:
             return
         resuming_block = rollout_id != block["start_step"]
         if resuming_block:
-            metadata = self.ray.get(self.manager.lightning_resume_metadata.remote())
-            policy_id = metadata.get("lightning_policy_id")
-            if (metadata.get("lightning_block_index") != index or not policy_id
-                    or metadata.get("lightning_global_sample_offset") != rollout_id * self.cfg["rollout_batch_size"]):
-                raise ValueError("Block Lightning resume cursor does not match its cached policy block.")
+            policy_id = self.resume_policy(index, rollout_id)
         else:
-            policy_id = "initial" if index == 0 else self.lineage
-            if index > 0:
-                policy_id = boundary_policy_id(self.args, self.cfg, self.models, index, rollout_id, policy_id)
+            policy_id = self.boundary_policy(index, rollout_id)
             self.ray.get(self.manager.prepare_lightning_block.remote(index, policy_id))
         self.ray.get(self.manager.offload.remote())
         try:
             if not resuming_block or needs_teacher_features(self.cfg):
-                score_teacher_block(self.args, index, policy_id)
+                score_teacher_block(self.args, index, policy_id, self.teacher)
+            if index == len(self.blocks) - 1:
+                self.teacher.close()  # No later block needs it; free its CPU weight copy and GPU context.
             self.ray.get(self.manager.load_lightning_block.remote(index, rollout_id, policy_id))
         finally:
             tags = [GPU_MEMORY_TYPE_WEIGHTS]
@@ -564,3 +826,31 @@ class BlockCoordinator:
             for tag in tags:
                 self.ray.get(self.manager.onload.remote(tags=[tag]))
         self.loaded = index
+
+    def ensure_resident_batch(self, block, rollout_id):
+        """Resident: stream the block from its first step; each step waits only for its own batch."""
+        index = block["index"]
+        if self.loaded != index:
+            if rollout_id != block["start_step"]:
+                # Resuming inside a block: settle() completed its files before the checkpoint was saved.
+                policy_id = self.resume_policy(index, rollout_id)
+                self.ray.get(self.manager.load_lightning_block.remote(index, rollout_id, policy_id))
+                self.loaded, self.streaming = index, None
+                return
+            policy_id = self.boundary_policy(index, rollout_id)
+            self.ray.get(self.manager.start_lightning_stream.remote(index, policy_id))
+            self.loaded, self.streaming = index, policy_id
+        if self.streaming is not None:
+            self.ray.get(self.manager.load_lightning_batch.remote(index, rollout_id, self.streaming))
+
+    def settle(self):
+        """Before the engines get new weights or a checkpoint is saved: finish the streaming block.
+
+        Its remaining rows must come from the block-start policy, and a resumed job reads the block files.
+        """
+        if self.resident and self.streaming is not None:
+            self.ray.get(self.manager.finish_lightning_stream.remote())
+
+    def close(self):
+        """Stop the persistent teacher servers."""
+        self.teacher.close()

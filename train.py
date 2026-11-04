@@ -101,76 +101,85 @@ def train(args):
     # Block Lightning keeps the engines offloaded between updates that no evaluation or generation needs.
     engines_offloaded = False
 
-    # train loop.
-    # note that for async training, one can change the position of the sync operation(ray.get).
-    for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        # TODO extract the duplicated eval logic
-        if args.eval_interval is not None and rollout_id == 0 and getattr(args, 'val_before_train', False):
-            evaluate(rollout_id, 0)
+    try:
+        # train loop.
+        # note that for async training, one can change the position of the sync operation(ray.get).
+        for rollout_id in range(args.start_rollout_id, args.num_rollout):
+            # TODO extract the duplicated eval logic
+            if args.eval_interval is not None and rollout_id == 0 and getattr(args, 'val_before_train', False):
+                evaluate(rollout_id, 0)
 
-        if block_coordinator is not None:
-            block_coordinator.ensure_block(rollout_id)
+            if block_coordinator is not None:
+                block_coordinator.ensure_block(rollout_id)
 
-        rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+            rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
-        if args.offload_rollout and not engines_offloaded:
-            ray.get(rollout_manager.offload.remote())
+            if args.offload_rollout and not engines_offloaded:
+                ray.get(rollout_manager.offload.remote())
 
-        if args.use_critic:
-            critic_train_handle = critic_model.async_train(rollout_id, rollout_data_ref)
-            if rollout_id >= args.num_critic_only_steps:
+            if args.use_critic:
+                critic_train_handle = critic_model.async_train(rollout_id, rollout_data_ref)
+                if rollout_id >= args.num_critic_only_steps:
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+                ray.get(critic_train_handle)
+            else:
                 ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
-            ray.get(critic_train_handle)
-        else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
-        completed_steps = rollout_id + 1
-        epoch_end = num_rollout_per_epoch is not None and completed_steps % num_rollout_per_epoch == 0
-        final_step = completed_steps == args.num_rollout
-        if getattr(args, "save_final_only", False):
-            should_save = final_step
-        else:
-            should_save = args.save_interval is not None and (
-                completed_steps % args.save_interval == 0 or epoch_end or final_step
+            completed_steps = rollout_id + 1
+            epoch_end = num_rollout_per_epoch is not None and completed_steps % num_rollout_per_epoch == 0
+            final_step = completed_steps == args.num_rollout
+            if getattr(args, "save_final_only", False):
+                should_save = final_step
+            else:
+                should_save = args.save_interval is not None and (
+                    completed_steps % args.save_interval == 0 or epoch_end or final_step
+                )
+            if should_save:
+                if block_coordinator is not None:
+                    block_coordinator.settle()  # A resumed job reads the streaming block's completed files.
+                # Save the full model and data cursor before evaluation. The
+                # evaluator prunes older checkpoints only after writing its results.
+                save_checkpoint(rollout_id)
+
+            # Policy lag: only sync rollout engine weights every update_weights_interval steps.
+            # When lag > 1, the rollout engine runs with stale weights; IS correction
+            # (--use-rollout-logprobs + --use-tis) handles the resulting distribution shift.
+            should_sync = (rollout_id - args.start_rollout_id + 1) % args.update_weights_interval == 0
+            evaluating = args.eval_interval is not None and (
+                completed_steps % args.eval_interval == 0 or epoch_end or final_step
             )
-        if should_save:
-            # Save the full model and data cursor before evaluation. The
-            # evaluator prunes older checkpoints only after writing its results.
-            save_checkpoint(rollout_id)
+            engines_needed = block_coordinator is None or lightning_opd_blocks.engines_needed_after(
+                block_coordinator.blocks, rollout_id, evaluating
+            )
 
-        # Policy lag: only sync rollout engine weights every update_weights_interval steps.
-        # When lag > 1, the rollout engine runs with stale weights; IS correction
-        # (--use-rollout-logprobs + --use-tis) handles the resulting distribution shift.
-        should_sync = (rollout_id - args.start_rollout_id + 1) % args.update_weights_interval == 0
-        evaluating = args.eval_interval is not None and (
-            completed_steps % args.eval_interval == 0 or epoch_end or final_step
-        )
-        engines_needed = block_coordinator is None or lightning_opd_blocks.engines_needed_after(
-            block_coordinator.blocks, rollout_id, evaluating
-        )
+            if engines_needed and block_coordinator is not None:
+                block_coordinator.settle()  # The streaming block's remaining rows need the block-start policy.
+            if not engines_needed:
+                pass  # Block Lightning: the actor stays on the GPUs (and keeps its NCCL groups); engines stay offloaded.
+            elif args.enable_weights_backuper:
+                offload_train()
+                onload_rollout()
+                if should_sync:
+                    actor_model.update_weights()
+            else:
+                actor_model.clear_memory()
+                onload_rollout()
+                if should_sync:
+                    actor_model.update_weights()
+                offload_train()
 
-        if not engines_needed:
-            pass  # Block Lightning: the actor stays on the GPUs (and keeps its NCCL groups); engines stay offloaded.
-        elif args.enable_weights_backuper:
-            offload_train()
-            onload_rollout()
-            if should_sync:
-                actor_model.update_weights()
-        else:
-            actor_model.clear_memory()
-            onload_rollout()
-            if should_sync:
-                actor_model.update_weights()
-            offload_train()
+            if args.offload_rollout and engines_needed:
+                if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
+                    ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH]))
+                ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE]))
+            engines_offloaded = args.offload_rollout and not engines_needed
 
-        if args.offload_rollout and engines_needed:
-            if GPU_MEMORY_TYPE_CUDA_GRAPH is not None:
-                ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_CUDA_GRAPH]))
-            ray.get(rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_KV_CACHE]))
-        engines_offloaded = args.offload_rollout and not engines_needed
+            if evaluating:
+                evaluate(rollout_id, completed_steps)
 
-        if evaluating:
-            evaluate(rollout_id, completed_steps)
+    finally:
+        if block_coordinator is not None:
+            block_coordinator.close()  # Stop the persistent teacher servers on any exit.
 
     actor_model.dispose()
     if critic_model is not None:
