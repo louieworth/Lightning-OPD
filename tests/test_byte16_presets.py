@@ -23,6 +23,10 @@ K120_SOURCE = "qwen3_1_7b_opd_nt_teacher_4b_instruct_2507.yaml"
 PAIRS = {
     "qwen3_1_7b_nt_teacher_4b_instruct_2507": ("Qwen3-1.7B", "Qwen3-4B-Instruct-2507", "qwen3-1.7B", {"enable_thinking": False}),
     "qwen3_1_7b_nt_teacher_4b": ("Qwen3-1.7B", "Qwen3-4B", "qwen3-1.7B", {"enable_thinking": False}),
+    "qwen3_1_7b_base_nt_teacher_4b_instruct_2507": (
+        "Qwen3-1.7B-Base", "Qwen3-4B-Instruct-2507", "qwen3-1.7B", {"enable_thinking": False}),
+    "qwen3_4b_base_nt_teacher_4b_instruct_2507": (
+        "Qwen3-4B-Base", "Qwen3-4B-Instruct-2507", "qwen3-4B", {"enable_thinking": False}),
     "r1_distill_qwen_1_5b_teacher_justrl_1_5b": (
         "DeepSeek-R1-Distill-Qwen-1.5B", "JustRL-DeepSeek-1.5B", "deepseek-r1-distill-qwen-1.5B", {}),
     "r1_distill_qwen_7b_teacher_light_r1_14b": (
@@ -41,8 +45,16 @@ APPROVED_EVAL = {"val_files", "val_n", "val_max_completion_length", "val_before_
 APPROVED_THROUGHPUT = {"sglang_max_running_requests": 64, "sglang_server_concurrency": 64, "precompute_concurrency": 1024}
 # User-approved 2026-11-02: D k120's 7B actor (4 GPUs, TP2) failed step 3 allocating 4.64 GiB of logits
 # while PyTorch held 10.28 GiB reserved but unallocated. Allocator only, training processes only.
-APPROVED_MEMORY = {"byte16_r1_distill_qwen_7b_teacher_light_r1_14b_k120.yaml": {
-    "train_env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}}
+# D k40 trains the same actor on the same 4 GPUs (resident layout, user decision 11/03).
+APPROVED_MEMORY = {f"byte16_{pair}_{k}.yaml": {"train_env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}
+                   for pair in ("r1_distill_qwen_7b_teacher_light_r1_14b", "qwen3_4b_base_nt_teacher_4b_instruct_2507")
+                   for k in ("k40", "k120")}
+
+
+# User-approved 11/04: the base student's engines need 40960 positions for 4096 + 32768 evaluation tokens.
+APPROVED_CONTEXT = {f"byte16_{pair}_{k}.yaml": {"sglang_context_length": 40960}
+                    for pair in ("qwen3_1_7b_base_nt_teacher_4b_instruct_2507", "qwen3_4b_base_nt_teacher_4b_instruct_2507")
+                    for k in ("k1", "k40", "k120")}
 
 
 def load(name):
@@ -54,7 +66,7 @@ def source(k):
 
 
 class Byte16PresetTests(unittest.TestCase):
-    def test_the_twelve_presets_exist(self):
+    def test_every_pair_has_k1_k40_and_k120_presets(self):
         self.assertEqual(sorted(path.name for path in CONFIGS.glob("byte16_*.yaml")), sorted(PRESETS))
 
     def test_k1_and_k40_are_lightning_opd_and_k120_is_standard_opd(self):
@@ -73,13 +85,13 @@ class Byte16PresetTests(unittest.TestCase):
             with self.subTest(config=name):
                 cfg, original = load(name), load(source(k))
                 changed = {key for key in cfg.keys() | original.keys() if cfg.get(key) != original.get(key)}
-                memory = APPROVED_MEMORY.get(name, {})
+                memory = dict(APPROVED_MEMORY.get(name, {}), **APPROVED_CONTEXT.get(name, {}))
                 k_blocks = {"policy_rollout_k"} if k == "k40" else set()
                 self.assertEqual(changed - PATHS_AND_LAYOUT - APPROVED_EVAL - set(APPROVED_THROUGHPUT) - set(memory) - k_blocks,
                                  set())
                 self.assertEqual({key: cfg[key] for key in APPROVED_THROUGHPUT}, APPROVED_THROUGHPUT)
 
-    def test_only_d_k120_training_uses_expandable_segments(self):
+    def test_only_the_4_gpu_d_and_4b_actors_use_expandable_segments(self):
         for name, (_, k) in PRESETS.items():
             with self.subTest(config=name):
                 expected = APPROVED_MEMORY.get(name, {}).get("train_env_vars", load(source(k)).get("train_env_vars"))
@@ -110,16 +122,21 @@ class Byte16PresetTests(unittest.TestCase):
                 with self.subTest(config=name):
                     self.assertEqual(split(load(name)), doubled)
 
-    def test_k40_uses_the_k1_layout(self):
+    def test_k40_keeps_every_model_resident_on_the_k120_layout(self):
+        # User decision 11/03: the colocated K=40 offloaded/onloaded/restarted models every 3 steps
+        # (SM mean 6.3%) and was reclaimed; Lightning with K > 10 uses dedicated GPUs instead.
         keys = ("actor_num_nodes", "actor_num_gpus_per_node", "colocate", "rollout_num_gpus", "teacher_num_gpus", "teacher_tp_size")
         for pair in PAIRS:
             with self.subTest(pair=pair):
-                k1, k40 = load(f"byte16_{pair}_k1.yaml"), load(f"byte16_{pair}_k40.yaml")
-                self.assertEqual({key: k40[key] for key in keys}, {key: k1[key] for key in keys})
+                k120, k40 = load(f"byte16_{pair}_k120.yaml"), load(f"byte16_{pair}_k40.yaml")
+                self.assertEqual({key: k40[key] for key in keys}, {key: k120[key] for key in keys})
+                self.assertFalse(k40["colocate"])
 
     def test_step_zero_is_evaluated_once_per_student(self):
         evaluated = sorted(name for name in PRESETS if load(name)["val_before_train"])
-        self.assertEqual(evaluated, ["byte16_qwen3_1_7b_nt_teacher_4b_instruct_2507_k1.yaml",
+        self.assertEqual(evaluated, ["byte16_qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k1.yaml",
+                                     "byte16_qwen3_1_7b_nt_teacher_4b_instruct_2507_k1.yaml",
+                                     "byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_k1.yaml",
                                      "byte16_r1_distill_qwen_1_5b_teacher_justrl_1_5b_k1.yaml",
                                      "byte16_r1_distill_qwen_7b_teacher_light_r1_14b_k1.yaml"])
 

@@ -2,7 +2,7 @@
 # tools/make_byte16_presets.py from qwen3_1_7b_nt_teacher_4b_instruct_2507_k1.yaml. K=1 (Lightning OPD / Semi-OPD). Changed: paths, models,
 # 16-GPU layout, eval = AIME24/25/26 + HMMT Feb26, avg@8, 32k, step-0 eval once per student
 # (user-approved items 7-10); generation throughput 64 requests/engine, 1024 client threads
-# (user-approved 11/02); K=120: the source GPU split doubled (actor 4, rollout 8, teacher TP4).
+# (user-approved 11/02); K=40/K=120: the OPD GPU split doubled (actor 4, rollout 8, teacher TP4).
 # All training settings are the source preset's.
 # Qwen3-1.7B Lightning OPD (instruct, non-thinking). Launcher keys follow the opd-baselines naming;
 # training keys map directly to slime flags (underscore -> hyphen).
