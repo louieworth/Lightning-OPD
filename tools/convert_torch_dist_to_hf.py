@@ -19,11 +19,20 @@ from typing_extensions import override
 from slime.backends.megatron_utils.megatron_to_hf import convert_to_hf, remove_padding
 
 
+class _AnyAttribute(type):
+    # Pickled enum members (e.g. AttnBackend.fused in Megatron 0.14 args) are restored as getattr(class, name).
+    def __getattr__(cls, name):
+        return cls
+
+
 class UnpicklerWrapper(pickle.Unpickler):
     @override
     def find_class(self, mod_name, name):
-        class DummyClass:
+        class DummyClass(metaclass=_AnyAttribute):
             def __init__(self, *args, **kwargs):
+                pass
+
+            def __setstate__(self, state):
                 pass
 
         if mod_name.startswith("megatron") or mod_name.startswith("glm"):
