@@ -56,6 +56,25 @@ class TrackingFinishTests(unittest.TestCase):
                 (run_file,) = Path(directory).glob("wandb/offline-run-*/run-*.wandb")
                 self.assertLessEqual(set(FINAL_EVAL), logged_keys(run_file))
 
+    def test_a_stalled_upload_never_blocks_shutdown(self):
+        # 11/05: a finished job hung 40+ minutes in wandb.finish() behind a stalled proxy upload.
+        import threading
+        import time
+        from unittest.mock import patch
+
+        from slime.utils import tracking_utils
+
+        release = threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            wandb.init(mode="offline", dir=directory, settings=wandb.Settings(x_disable_stats=True, console="off"))
+            with patch.object(tracking_utils.wandb, "finish", side_effect=lambda: release.wait(30)):
+                started = time.monotonic()
+                self.assertFalse(tracking_utils.finish_tracking(timeout=0.5))
+                self.assertLess(time.monotonic() - started, 5)
+            release.set()
+            self.assertTrue(tracking_utils.finish_tracking(timeout=30))  # a healthy finish still completes
+            self.assertIsNone(wandb.run)
+
 
 if __name__ == "__main__":
     unittest.main()
