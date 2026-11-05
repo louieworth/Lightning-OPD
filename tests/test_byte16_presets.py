@@ -23,6 +23,8 @@ K120_SOURCE = "qwen3_1_7b_opd_nt_teacher_4b_instruct_2507.yaml"
 PAIRS = {
     "qwen3_1_7b_nt_teacher_4b_instruct_2507": ("Qwen3-1.7B", "Qwen3-4B-Instruct-2507", "qwen3-1.7B", {"enable_thinking": False}),
     "qwen3_1_7b_nt_teacher_4b": ("Qwen3-1.7B", "Qwen3-4B", "qwen3-1.7B", {"enable_thinking": False}),
+    "qwen3_0_6b_base_nt_teacher_4b_instruct_2507": (
+        "Qwen3-0.6B-Base", "Qwen3-4B-Instruct-2507", "qwen3-0.6B", {"enable_thinking": False}),
     "qwen3_1_7b_base_nt_teacher_4b_instruct_2507": (
         "Qwen3-1.7B-Base", "Qwen3-4B-Instruct-2507", "qwen3-1.7B", {"enable_thinking": False}),
     "qwen3_4b_base_nt_teacher_4b_instruct_2507": (
@@ -51,18 +53,18 @@ APPROVED_MEMORY = {f"byte16_{pair}_{k}.yaml": {"train_env_vars": {"PYTORCH_CUDA_
                    for k in ("k40", "k120")}
 
 
-# User-approved 11/04: the base student's engines need 40960 positions for 4096 + 32768 evaluation tokens.
+# Base students (user decisions 11/04-11/05); the instruct and R1 presets keep their settings.
+BASE_PAIRS = ("qwen3_0_6b_base_nt_teacher_4b_instruct_2507", "qwen3_1_7b_base_nt_teacher_4b_instruct_2507",
+              "qwen3_4b_base_nt_teacher_4b_instruct_2507")
+BASE_EVAL = [f"/opt/tiger/Lightning-OPD/data/lightning_opd/eval/{name}.parquet"
+             for name in ("amc23", "aime26", "hmmt26", "gpqa_diamond_physics")]
+# Engines need 40960 positions only if a 4096-token prompt meets a 32768-token evaluation (kept harmlessly at 16k).
 APPROVED_CONTEXT = {f"byte16_{pair}_{k}.yaml": {"sglang_context_length": 40960}
-                    for pair in ("qwen3_1_7b_base_nt_teacher_4b_instruct_2507", "qwen3_4b_base_nt_teacher_4b_instruct_2507")
-                    for k in ("k1", "k40", "k120")}
-
-
-# User-approved 11/04: larger engine batches for the 4B base pair (memory 0.6 on dedicated rollout GPUs; 0.7 OOMed).
-APPROVED_BATCH = {f"byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_{k}.yaml": dict(
+                    for pair in BASE_PAIRS for k in ("k1", "k40", "k120")}
+# Larger engine batches (memory 0.6; 0.7 and 0.85 ran out of activation memory).
+APPROVED_BATCH = {f"byte16_{pair}_{k}.yaml": dict(
     sglang_max_running_requests=256, sglang_server_concurrency=256, precompute_concurrency=4096,
-    sglang_mem_fraction_static=0.6) for k in ("k1", "k40", "k120")}
-APPROVED_BATCH["byte16_qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k120.yaml"] = APPROVED_BATCH[
-    "byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_k120.yaml"]
+    sglang_mem_fraction_static=0.6) for pair in BASE_PAIRS for k in ("k1", "k40", "k120")}
 
 
 def load(name):
@@ -117,17 +119,20 @@ class Byte16PresetTests(unittest.TestCase):
                 self.assertEqual((cfg["model_path"], cfg["teacher_model_path"], cfg["model_type"]),
                                  (str(MODELS / student), str(MODELS / teacher), model_type))
                 self.assertEqual(cfg["apply_chat_template_kwargs"], chat)
-                # User decision 11/05: base students evaluate avg@4 (32k avg@8 evaluations took ~1 hour).
-                samples = 4 if "_base_" in pair else 8
-                self.assertEqual((cfg["val_files"], cfg["val_n"], cfg["val_max_completion_length"]), (evaluation, samples, 32768))
+                # User decision 11/05: base students evaluate AMC23/AIME26/HMMT26/GPQA Diamond Physics, avg@8,
+                # 16k new tokens, under _v2 experiment names; every other pair keeps its evaluation.
+                base = pair in BASE_PAIRS
+                self.assertEqual((cfg["val_files"], cfg["val_n"], cfg["val_max_completion_length"]),
+                                 (BASE_EVAL, 8, 16384) if base else (evaluation, 8, 32768))
                 self.assertEqual((cfg["ray_cluster"], cfg["nnodes"], cfg["n_gpus_per_node"]), ("existing", 2, 8))
-                self.assertEqual(cfg["experiment_name"], f"{pair}_{k}_byte16")
+                self.assertEqual(cfg["experiment_name"], f"{pair}_{k}_byte16" + ("_v2" if base else ""))
 
-    def test_4b_base_k40_and_k120_use_actor_4_rollout_10_teacher_2(self):
+    def test_base_k40_and_k120_use_actor_4_rollout_10_teacher_2(self):
         # User decision 11/05: evaluations left the teacher GPUs idle; give two of them to inference
         # (actor 2 : rollout 12 made 4B training steps 2.2x slower).
-        for k in ("k40", "k120"):
-            cfg = load(f"byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_{k}.yaml")
+        for pair in BASE_PAIRS:
+          for k in ("k40", "k120"):
+            cfg = load(f"byte16_{pair}_{k}.yaml")
             self.assertEqual((cfg["actor_num_nodes"] * cfg["actor_num_gpus_per_node"], cfg["rollout_num_gpus"],
                               cfg["teacher_num_gpus"], cfg["teacher_tp_size"], cfg["colocate"]), (4, 10, 2, 2, False))
 
@@ -138,7 +143,7 @@ class Byte16PresetTests(unittest.TestCase):
 
         doubled = tuple(2 * gpus for gpus in split(load(K120_SOURCE)))
         for name, (pair, k) in PRESETS.items():
-            if k == "k120" and pair != "qwen3_4b_base_nt_teacher_4b_instruct_2507":
+            if k == "k120" and pair not in BASE_PAIRS:
                 with self.subTest(config=name):
                     self.assertEqual(split(load(name)), doubled)
 
@@ -155,7 +160,8 @@ class Byte16PresetTests(unittest.TestCase):
 
     def test_step_zero_is_evaluated_once_per_student(self):
         evaluated = sorted(name for name in PRESETS if load(name)["val_before_train"])
-        self.assertEqual(evaluated, ["byte16_qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k1.yaml",
+        self.assertEqual(evaluated, ["byte16_qwen3_0_6b_base_nt_teacher_4b_instruct_2507_k1.yaml",
+                                     "byte16_qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k1.yaml",
                                      "byte16_qwen3_1_7b_nt_teacher_4b_instruct_2507_k1.yaml",
                                      "byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_k1.yaml",
                                      "byte16_r1_distill_qwen_1_5b_teacher_justrl_1_5b_k1.yaml",

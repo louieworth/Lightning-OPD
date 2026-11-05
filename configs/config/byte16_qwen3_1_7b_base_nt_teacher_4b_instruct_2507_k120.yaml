@@ -26,9 +26,9 @@ cuda_home: null
 # W&B settings and credentials; relative env_file paths resolve from the repo root.
 env_file: .env
 use_wandb: true
-experiment_name: qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k120_byte16
+experiment_name: qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k120_byte16_v2
 output_dir: /opt/tiger/Lightning-OPD/outputs
-wandb_dir: wandb/qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k120_byte16
+wandb_dir: wandb/qwen3_1_7b_base_nt_teacher_4b_instruct_2507_k120_byte16_v2
 resume: auto  # Resume this experiment when a full training checkpoint is present.
 
 # Cluster allocation: 2 nodes x 4 H100s (8 total); sbatch wall time is 10 hours.
@@ -41,7 +41,7 @@ actor_num_gpus_per_node: 4
 # The launcher reserves the final node's final 2 GPUs for the teacher and
 # exposes the other 6 GPUs to Ray, in slime's IP-sorted GPU order.
 colocate: false
-rollout_num_gpus: 8
+rollout_num_gpus: 10
 rollout_num_gpus_per_engine: 1
 sglang_mem_fraction_static: 0.6
 # Bound long-answer inference/evaluation and retain worker health checks.
@@ -85,8 +85,8 @@ balance_data: false
 precompute_concurrency: 4096
 precompute_port: 13142
 precompute_tp_size: 2
-teacher_num_gpus: 4
-teacher_tp_size: 4
+teacher_num_gpus: 2
+teacher_tp_size: 2
 teacher_port: 13141
 teacher_mem_fraction_static: 0.6
 teacher_context_length: 32768
@@ -142,13 +142,13 @@ eval_steps: 20
 eval_on_resume: true  # Recover an evaluation interrupted after checkpoint saving.
 val_before_train: false
 val_files:
-  - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/aime24.parquet
-  - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/aime25.parquet
+  - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/amc23.parquet
   - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/aime26.parquet
   - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/hmmt26.parquet
+  - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/gpqa_diamond_physics.parquet
 val_max_prompt_length: 4096
-val_max_completion_length: 32768
-val_n: 4
+val_max_completion_length: 16384
+val_n: 8
 val_temperature: 1.0
 val_top_p: 1.0
 val_top_k: -1

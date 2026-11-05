@@ -24,6 +24,9 @@ SOURCES = {"k1": "qwen3_1_7b_nt_teacher_4b_instruct_2507_k1.yaml", "k40": "qwen3
 PAIRS = {  # name -> (student, teacher, model_type, chat template kwargs)
     "qwen3_1_7b_nt_teacher_4b_instruct_2507": ("Qwen3-1.7B", "Qwen3-4B-Instruct-2507", "qwen3-1.7B", {"enable_thinking": False}),
     "qwen3_1_7b_nt_teacher_4b": ("Qwen3-1.7B", "Qwen3-4B", "qwen3-1.7B", {"enable_thinking": False}),
+    # User request 11/05: the 0.6B base student with the same teacher (base presets share their sources).
+    "qwen3_0_6b_base_nt_teacher_4b_instruct_2507": (
+        "Qwen3-0.6B-Base", "Qwen3-4B-Instruct-2507", "qwen3-0.6B", {"enable_thinking": False}),
     # User request 11/04: the base student with A's teacher; the base Slurm presets differ from the
     # instruct ones only in model_path, so the same sources apply.
     "qwen3_1_7b_base_nt_teacher_4b_instruct_2507": (
@@ -38,7 +41,7 @@ PAIRS = {  # name -> (student, teacher, model_type, chat template kwargs)
     "r1_distill_qwen_7b_teacher_light_r1_14b": (
         "DeepSeek-R1-Distill-Qwen-7B", "Light-R1-14B-DS", "deepseek-r1-distill-qwen-7B", {}),
 }
-STEP_ZERO = {"qwen3_1_7b_nt_teacher_4b_instruct_2507", "r1_distill_qwen_1_5b_teacher_justrl_1_5b",
+STEP_ZERO = {"qwen3_0_6b_base_nt_teacher_4b_instruct_2507", "qwen3_1_7b_nt_teacher_4b_instruct_2507", "r1_distill_qwen_1_5b_teacher_justrl_1_5b",
              "r1_distill_qwen_7b_teacher_light_r1_14b", "qwen3_1_7b_base_nt_teacher_4b_instruct_2507",
              "qwen3_4b_base_nt_teacher_4b_instruct_2507"}  # Once per student; pair B shares A's student.
 COMMON = dict(
@@ -72,25 +75,27 @@ MEMORY = {(pair, k): dict(train_env_vars={"PYTORCH_CUDA_ALLOC_CONF": "expandable
 # User-approved 11/04: Qwen3-1.7B-Base's config allows 32768 positions, fewer than a 4096-token prompt plus the
 # 32768-token evaluation (its step-0 evaluation failed). Its engines use Qwen3-1.7B's 40960 (same RoPE base).
 CONTEXT = {pair: dict(sglang_context_length=40960) for pair in
-           ("qwen3_1_7b_base_nt_teacher_4b_instruct_2507", "qwen3_4b_base_nt_teacher_4b_instruct_2507")}
-# User-approved 11/04 for the 4B base pair (and the resumed 1.7B base K=120): engines decoded mostly <=16 sequences and hit the 64-request
-# cap with full KV cache during evaluations. Up to 256 running requests per engine; dedicated rollout GPUs
-# (K=40/K=120) also get SGLang memory 0.6: 0.85 (11/02) and 0.7 (11/04, 1.7B base K=120 eval: a 4.56 GiB
-# prefill-logits allocation) ran out of activation memory. Colocated K=1 also uses 0.6: its engines hold their KV
-# cache only while the actor is offloaded (~3 GB left on the GPU), so the headroom matches dedicated GPUs.
-THROUGHPUT = {("qwen3_4b_base_nt_teacher_4b_instruct_2507", k): dict(
+           ("qwen3_0_6b_base_nt_teacher_4b_instruct_2507", "qwen3_1_7b_base_nt_teacher_4b_instruct_2507",
+            "qwen3_4b_base_nt_teacher_4b_instruct_2507")}
+# Base students (user decisions 11/04-11/05). Only these pairs; the instruct and R1 presets are unchanged.
+BASE_PAIRS = ("qwen3_0_6b_base_nt_teacher_4b_instruct_2507", "qwen3_1_7b_base_nt_teacher_4b_instruct_2507",
+              "qwen3_4b_base_nt_teacher_4b_instruct_2507")
+BASE = dict(
+    # Eval 11/05: AMC23, AIME26, HMMT Feb26 and GPQA Diamond Physics (86 four-option questions), avg@8 with
+    # 16k new tokens (32k evaluations of base students took ~1 hour). Experiment names end in _v2 so these
+    # runs never resume or overwrite the earlier base runs evaluated on AIME24/25/26 + HMMT26 at 32k.
+    val_files=[str(DATA / f"eval/{name}.parquet") for name in ("amc23", "aime26", "hmmt26", "gpqa_diamond_physics")],
+    val_n=8, val_max_completion_length=16384,
+    # Engines decoded mostly <=16 sequences and hit the 64-request cap with full KV caches during evaluations:
+    # up to 256 running requests per engine, 4096 block-generation client threads, SGLang memory 0.6 (0.85
+    # on 11/02 and 0.7 on 11/04 ran out of activation memory; colocated K=1 engines hold their KV cache only
+    # while the actor is offloaded, ~3 GB left, so 0.6 fits there too).
     sglang_max_running_requests=256, sglang_server_concurrency=256, precompute_concurrency=4096,
-    sglang_mem_fraction_static=0.6) for k in ("k1", "k40", "k120")}
-THROUGHPUT[("qwen3_1_7b_base_nt_teacher_4b_instruct_2507", "k120")] = THROUGHPUT[("qwen3_4b_base_nt_teacher_4b_instruct_2507", "k120")]
-# User decision 11/05 for the 4B base pair: evaluations (984 requests of up to 32k tokens) ran on 8 rollout
-# GPUs while the 4 teacher GPUs sat idle. K=40/K=120 use actor 4 : rollout 10 : teacher 2 (TP2 teacher).
-# Actor 2 : rollout 12 was tried first and made each 4B training step 2.2x slower (50 s -> 110 s).
-LAYOUT_OVERRIDE = {("qwen3_4b_base_nt_teacher_4b_instruct_2507", k): dict(
-    actor_num_nodes=1, actor_num_gpus_per_node=4, rollout_num_gpus=10, teacher_num_gpus=2, teacher_tp_size=2)
-    for k in ("k40", "k120")}
-# User decision 11/05: base students' evaluations grew to the 32k limit and took ~1 hour each; base pairs
-# keep 32k but sample 4 responses per problem (avg@4) instead of 8 (runs resumed after this keep their avg@8 points).
-EVAL_N4 = {"qwen3_1_7b_base_nt_teacher_4b_instruct_2507", "qwen3_4b_base_nt_teacher_4b_instruct_2507"}
+    sglang_mem_fraction_static=0.6)
+# K=40/K=120: actor 4 : rollout 10 : teacher 2 (TP2). Evaluations ran on 8 rollout GPUs while 4 TP4 teacher
+# GPUs idled; actor 2 : rollout 12 made 4B training steps 2.2x slower (50 s -> 110 s).
+BASE_DEDICATED = dict(actor_num_nodes=1, actor_num_gpus_per_node=4, rollout_num_gpus=10, teacher_num_gpus=2,
+                      teacher_tp_size=2)
 HEADER = ("# 1102 cluster (2 pods x 8 H100, pre-started Ray, no shared filesystem); generated by\n"
           "# tools/make_byte16_presets.py from {source}. K={k} ({method}). Changed: paths, models,\n"
           "# 16-GPU layout, eval = AIME24/25/26 + HMMT Feb26, avg@8, 32k, step-0 eval once per student\n"
@@ -135,15 +140,13 @@ def main():
     for pair, (student, teacher, model_type, chat) in PAIRS.items():
         for k, source in SOURCES.items():
             text = (CONFIGS / source).read_text()
-            name = f"{pair}_{k}_byte16"
+            name = f"{pair}_{k}_byte16" + ("_v2" if pair in BASE_PAIRS else "")
             values = dict(COMMON, **LAYOUT[k], model_path=str(MODELS / student), teacher_model_path=str(MODELS / teacher),
                           model_type=model_type, apply_chat_template_kwargs=chat, experiment_name=name,
                           val_before_train=k == "k1" and pair in STEP_ZERO, **MEMORY.get((pair, k), {}),
                           **CONTEXT.get(pair, {}))
-            values.update(THROUGHPUT.get((pair, k), {}))
-            values.update(LAYOUT_OVERRIDE.get((pair, k), {}))
-            if pair in EVAL_N4:
-                values["val_n"] = 4
+            if pair in BASE_PAIRS:
+                values.update(BASE, **(BASE_DEDICATED if k != "k1" else {}))
             if "wandb_dir" in yaml.safe_load(text):
                 values["wandb_dir"] = f"wandb/{name}"
             target = CONFIGS / f"byte16_{pair}_{k}.yaml"

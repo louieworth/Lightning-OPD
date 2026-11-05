@@ -25,7 +25,7 @@ cuda_home: null
 # W&B settings and credentials; relative env_file paths resolve from the repo root.
 env_file: .env
 use_wandb: true
-experiment_name: qwen3_4b_base_nt_teacher_4b_instruct_2507_k40_byte16
+experiment_name: qwen3_4b_base_nt_teacher_4b_instruct_2507_k40_byte16_v2
 output_dir: /opt/tiger/Lightning-OPD/outputs
 resume: auto  # Resume a present training checkpoint; otherwise start from the base model.
 
@@ -150,13 +150,13 @@ eval_steps: 20
 eval_on_resume: true  # Recover an evaluation interrupted after checkpoint saving.
 val_before_train: false
 val_files:
-  - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/aime24.parquet
-  - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/aime25.parquet
+  - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/amc23.parquet
   - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/aime26.parquet
   - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/hmmt26.parquet
+  - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/gpqa_diamond_physics.parquet
 val_max_prompt_length: 4096
-val_max_completion_length: 32768
-val_n: 4
+val_max_completion_length: 16384
+val_n: 8
 val_temperature: 1.0
 val_top_p: 1.0
 val_top_k: -1
