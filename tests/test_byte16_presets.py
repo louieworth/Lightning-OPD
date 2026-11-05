@@ -121,14 +121,22 @@ class Byte16PresetTests(unittest.TestCase):
                 self.assertEqual((cfg["ray_cluster"], cfg["nnodes"], cfg["n_gpus_per_node"]), ("existing", 2, 8))
                 self.assertEqual(cfg["experiment_name"], f"{pair}_{k}_byte16")
 
+    def test_4b_base_k40_and_k120_use_actor_4_rollout_10_teacher_2(self):
+        # User decision 11/05: evaluations left the teacher GPUs idle; give two of them to inference
+        # (actor 2 : rollout 12 made 4B training steps 2.2x slower).
+        for k in ("k40", "k120"):
+            cfg = load(f"byte16_qwen3_4b_base_nt_teacher_4b_instruct_2507_{k}.yaml")
+            self.assertEqual((cfg["actor_num_nodes"] * cfg["actor_num_gpus_per_node"], cfg["rollout_num_gpus"],
+                              cfg["teacher_num_gpus"], cfg["teacher_tp_size"], cfg["colocate"]), (4, 10, 2, 2, False))
+
     def test_opd_doubles_the_source_gpu_split(self):
         def split(cfg):
             return (cfg["actor_num_nodes"] * cfg["actor_num_gpus_per_node"], cfg["rollout_num_gpus"],
                     cfg["teacher_num_gpus"], cfg["teacher_tp_size"])
 
         doubled = tuple(2 * gpus for gpus in split(load(K120_SOURCE)))
-        for name, (_, k) in PRESETS.items():
-            if k == "k120":
+        for name, (pair, k) in PRESETS.items():
+            if k == "k120" and pair != "qwen3_4b_base_nt_teacher_4b_instruct_2507":
                 with self.subTest(config=name):
                     self.assertEqual(split(load(name)), doubled)
 
@@ -139,6 +147,7 @@ class Byte16PresetTests(unittest.TestCase):
         for pair in PAIRS:
             with self.subTest(pair=pair):
                 k120, k40 = load(f"byte16_{pair}_k120.yaml"), load(f"byte16_{pair}_k40.yaml")
+                # (the 4B base pair moves both to actor 4 : rollout 10 : teacher 2, 11/05)
                 self.assertEqual({key: k40[key] for key in keys}, {key: k120[key] for key in keys})
                 self.assertFalse(k40["colocate"])
 

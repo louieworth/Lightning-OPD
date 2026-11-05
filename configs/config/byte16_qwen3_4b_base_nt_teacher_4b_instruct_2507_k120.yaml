@@ -41,7 +41,7 @@ actor_num_gpus_per_node: 4
 # The launcher reserves the final node's final 2 GPUs for the teacher and
 # exposes the other 6 GPUs to Ray, in slime's IP-sorted GPU order.
 colocate: false
-rollout_num_gpus: 8
+rollout_num_gpus: 10
 rollout_num_gpus_per_engine: 1
 sglang_mem_fraction_static: 0.6
 # Bound long-answer inference/evaluation and retain worker health checks.
@@ -85,8 +85,8 @@ balance_data: false
 precompute_concurrency: 4096
 precompute_port: 13142
 precompute_tp_size: 2
-teacher_num_gpus: 4
-teacher_tp_size: 4
+teacher_num_gpus: 2
+teacher_tp_size: 2
 teacher_port: 13141
 teacher_mem_fraction_static: 0.6
 teacher_context_length: 32768

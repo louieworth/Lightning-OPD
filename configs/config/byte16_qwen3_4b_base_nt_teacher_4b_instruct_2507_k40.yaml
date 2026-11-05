@@ -38,7 +38,7 @@ actor_num_gpus_per_node: 4
 # Student inference engines share actor GPUs for block rollouts and evaluation.
 # Actor/inference memory is offloaded before each block's temporary teacher scoring.
 colocate: false
-rollout_num_gpus: 8
+rollout_num_gpus: 10
 rollout_num_gpus_per_engine: 1
 sglang_mem_fraction_static: 0.6
 # Bound 16k-token evaluation requests; the upstream default is 512 per engine.
@@ -91,8 +91,8 @@ balance_data: false
 precompute_concurrency: 4096
 precompute_port: 13142
 precompute_tp_size: 2  # Legacy preparer only; block rollouts use rollout_num_gpus_per_engine.
-teacher_num_gpus: 4
-teacher_tp_size: 4
+teacher_num_gpus: 2
+teacher_tp_size: 2
 teacher_port: 13141
 teacher_mem_fraction_static: 0.6
 teacher_context_length: 32768
