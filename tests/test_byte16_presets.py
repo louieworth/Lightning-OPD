@@ -117,7 +117,9 @@ class Byte16PresetTests(unittest.TestCase):
                 self.assertEqual((cfg["model_path"], cfg["teacher_model_path"], cfg["model_type"]),
                                  (str(MODELS / student), str(MODELS / teacher), model_type))
                 self.assertEqual(cfg["apply_chat_template_kwargs"], chat)
-                self.assertEqual((cfg["val_files"], cfg["val_n"], cfg["val_max_completion_length"]), (evaluation, 8, 32768))
+                # User decision 11/05: base students evaluate avg@4 (32k avg@8 evaluations took ~1 hour).
+                samples = 4 if "_base_" in pair else 8
+                self.assertEqual((cfg["val_files"], cfg["val_n"], cfg["val_max_completion_length"]), (evaluation, samples, 32768))
                 self.assertEqual((cfg["ray_cluster"], cfg["nnodes"], cfg["n_gpus_per_node"]), ("existing", 2, 8))
                 self.assertEqual(cfg["experiment_name"], f"{pair}_{k}_byte16")
 

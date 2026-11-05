@@ -156,7 +156,7 @@ val_files:
   - /opt/tiger/Lightning-OPD/data/lightning_opd/eval/hmmt26.parquet
 val_max_prompt_length: 4096
 val_max_completion_length: 32768
-val_n: 8
+val_n: 4
 val_temperature: 1.0
 val_top_p: 1.0
 val_top_k: -1
