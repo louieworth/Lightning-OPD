@@ -38,9 +38,9 @@ PRESETS = {f"byte16_{pair}_{k}.yaml": (pair, k) for pair in PAIRS for k in ("k1"
 # User request 11/06: K=20 for the 0.6B and 1.7B base students only.
 K20_PAIRS = ("qwen3_0_6b_base_nt_teacher_4b_instruct_2507", "qwen3_1_7b_base_nt_teacher_4b_instruct_2507",
              "qwen3_4b_base_nt_teacher_4b_instruct_2507")
-PRESETS.update({f"byte16_{pair}_k20.yaml": (pair, "k20") for pair in K20_PAIRS})
+PRESETS.update({f"byte16_{pair}_{k}.yaml": (pair, k) for pair in K20_PAIRS for k in ("k10", "k20")})
 # Lightning presets and their number of current-policy rollout blocks (policy_rollout_k).
-LIGHTNING_K = {"k1": 1, "k20": 20, "k40": 40}
+LIGHTNING_K = {"k1": 1, "k10": 10, "k20": 20, "k40": 40}
 PATHS_AND_LAYOUT = {"model_path", "teacher_model_path", "model_type", "hf_home", "output_dir", "experiment_name",
                     "wandb_dir", "source_data_dir", "train_files", "ray_cluster", "nnodes", "n_gpus_per_node",
                     "actor_num_nodes", "actor_num_gpus_per_node", "colocate", "rollout_num_gpus",
@@ -54,7 +54,7 @@ APPROVED_THROUGHPUT = {"sglang_max_running_requests": 64, "sglang_server_concurr
 # D k40 trains the same actor on the same 4 GPUs (resident layout, user decision 11/03).
 APPROVED_MEMORY = {f"byte16_{pair}_{k}.yaml": {"train_env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}
                    for pair in ("r1_distill_qwen_7b_teacher_light_r1_14b", "qwen3_4b_base_nt_teacher_4b_instruct_2507")
-                   for k in ("k20", "k40", "k120")}
+                   for k in ("k10", "k20", "k40", "k120")}
 
 
 # Base students (user decisions 11/04-11/05); the instruct and R1 presets keep their settings.
@@ -64,11 +64,11 @@ BASE_EVAL = [f"/opt/tiger/Lightning-OPD/data/lightning_opd/eval/{name}.parquet"
              for name in ("amc23", "aime26", "hmmt26", "gpqa_diamond_physics")]
 # Engines need 40960 positions only if a 4096-token prompt meets a 32768-token evaluation (kept harmlessly at 16k).
 APPROVED_CONTEXT = {f"byte16_{pair}_{k}.yaml": {"sglang_context_length": 40960}
-                    for pair in BASE_PAIRS for k in ("k1", "k20", "k40", "k120")}
+                    for pair in BASE_PAIRS for k in ("k1", "k10", "k20", "k40", "k120")}
 # Larger engine batches (memory 0.6; 0.7 and 0.85 ran out of activation memory).
 APPROVED_BATCH = {f"byte16_{pair}_{k}.yaml": dict(
     sglang_max_running_requests=256, sglang_server_concurrency=256, precompute_concurrency=4096,
-    sglang_mem_fraction_static=0.6) for pair in BASE_PAIRS for k in ("k1", "k20", "k40", "k120")}
+    sglang_mem_fraction_static=0.6) for pair in BASE_PAIRS for k in ("k1", "k10", "k20", "k40", "k120")}
 
 
 def load(name):
@@ -100,7 +100,7 @@ class Byte16PresetTests(unittest.TestCase):
                 cfg, original = load(name), load(source(k))
                 changed = {key for key in cfg.keys() | original.keys() if cfg.get(key) != original.get(key)}
                 memory = dict(APPROVED_MEMORY.get(name, {}), **APPROVED_CONTEXT.get(name, {}), **APPROVED_BATCH.get(name, {}))
-                k_blocks = {"policy_rollout_k"} if k in ("k20", "k40") else set()
+                k_blocks = {"policy_rollout_k"} if k in ("k10", "k20", "k40") else set()
                 self.assertEqual(changed - PATHS_AND_LAYOUT - APPROVED_EVAL - set(APPROVED_THROUGHPUT) - set(memory) - k_blocks,
                                  set())
                 expected = dict(APPROVED_THROUGHPUT, **{key: value for key, value in APPROVED_BATCH.get(name, {}).items()
@@ -162,8 +162,9 @@ class Byte16PresetTests(unittest.TestCase):
                 self.assertEqual({key: k40[key] for key in keys}, {key: k120[key] for key in keys})
                 self.assertFalse(k40["colocate"])
                 if pair in K20_PAIRS:
-                    k20 = load(f"byte16_{pair}_k20.yaml")
-                    self.assertEqual({key: k20[key] for key in keys}, {key: k40[key] for key in keys})
+                    for small in ("k10", "k20"):
+                        cfg = load(f"byte16_{pair}_{small}.yaml")
+                        self.assertEqual({key: cfg[key] for key in keys}, {key: k40[key] for key in keys})
 
     def test_step_zero_is_evaluated_once_per_student(self):
         evaluated = sorted(name for name in PRESETS if load(name)["val_before_train"])

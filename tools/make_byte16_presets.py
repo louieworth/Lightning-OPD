@@ -65,6 +65,8 @@ LAYOUT = {
     "k40": dict(DEDICATED, policy_rollout_k=40),
     # User request 11/06: K=20 (20 blocks of 6 steps) for the 0.6B and 1.7B base students only.
     "k20": dict(DEDICATED, policy_rollout_k=20),
+    # User request 11/06: K=10 (10 blocks of 12 steps) for the base students, on the same resident split.
+    "k10": dict(DEDICATED, policy_rollout_k=10),
     "k120": DEDICATED,
 }
 # User-approved 11/02: D k120's 7B actor (4 GPUs, TP2) hit a fragmentation OOM at step 3 (4.64 GiB of logits
@@ -73,7 +75,7 @@ LAYOUT = {
 # The 4B base actor also trains on those 4 GPUs (allocator setting only, as for D).
 MEMORY = {(pair, k): dict(train_env_vars={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
           for pair in ("r1_distill_qwen_7b_teacher_light_r1_14b", "qwen3_4b_base_nt_teacher_4b_instruct_2507")
-          for k in ("k20", "k40", "k120")}
+          for k in ("k10", "k20", "k40", "k120")}
 # User-approved 11/04: Qwen3-1.7B-Base's config allows 32768 positions, fewer than a 4096-token prompt plus the
 # 32768-token evaluation (its step-0 evaluation failed). Its engines use Qwen3-1.7B's 40960 (same RoPE base).
 CONTEXT = {pair: dict(sglang_context_length=40960) for pair in
@@ -142,7 +144,8 @@ def override(text, values):
 def main():
     written = []
     for pair, (student, teacher, model_type, chat) in PAIRS.items():
-        for k, source in list(SOURCES.items()) + ([("k20", SOURCES["k40"])] if pair in K20_PAIRS else []):
+        extra = [(k, SOURCES["k40"]) for k in ("k10", "k20") if pair in K20_PAIRS]
+        for k, source in list(SOURCES.items()) + extra:
             text = (CONFIGS / source).read_text()
             name = f"{pair}_{k}_byte16" + ("_v2" if pair in BASE_PAIRS else "")
             values = dict(COMMON, **LAYOUT[k], model_path=str(MODELS / student), teacher_model_path=str(MODELS / teacher),
@@ -154,7 +157,8 @@ def main():
             if "wandb_dir" in yaml.safe_load(text):
                 values["wandb_dir"] = f"wandb/{name}"
             target = CONFIGS / f"byte16_{pair}_{k}.yaml"
-            method = {"k1": "Lightning OPD / Semi-OPD", "k20": "Lightning OPD, 20 rollout blocks",
+            method = {"k1": "Lightning OPD / Semi-OPD", "k10": "Lightning OPD, 10 rollout blocks",
+                      "k20": "Lightning OPD, 20 rollout blocks",
                       "k40": "Lightning OPD, 40 rollout blocks"}.get(k, "standard OPD")
             target.write_text(HEADER.format(source=source, k=k[1:], method=method) + override(text, values))
             cfg = yaml.safe_load(target.read_text())
