@@ -75,6 +75,29 @@ class TrackingFinishTests(unittest.TestCase):
             self.assertTrue(tracking_utils.finish_tracking(timeout=30))  # a healthy finish still completes
             self.assertIsNone(wandb.run)
 
+    def test_a_process_with_a_stalled_upload_still_exits(self):
+        # 11/05: train.py wrote training_status.json and then hung in W&B's exit hook (finished runs).
+        import subprocess
+        import sys
+        import time
+
+        script = """
+import threading, wandb
+from unittest.mock import patch
+from slime.utils import tracking_utils
+wandb.init(mode="offline", dir=%r, settings=wandb.Settings(x_disable_stats=True, console="off"))
+block = threading.Event()
+with patch.object(tracking_utils.wandb, "finish", side_effect=lambda *a, **k: block.wait()):
+    tracking_utils.finish_tracking_or_exit(timeout=1)
+raise SystemExit(3)  # not reached: the stalled finish ends the process with status 0
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            started = time.monotonic()
+            result = subprocess.run([sys.executable, "-c", script % directory], capture_output=True, text=True,
+                                    timeout=120, cwd=Path(__file__).resolve().parents[1])
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            self.assertLess(time.monotonic() - started, 90)
+
 
 if __name__ == "__main__":
     unittest.main()

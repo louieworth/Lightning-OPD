@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
+import sys
 import threading
 
 import wandb
@@ -47,6 +49,23 @@ def finish_tracking(timeout=FINISH_TIMEOUT_S):
     logger.warning("W&B finish did not complete within %s s; continuing shutdown. Upload later with "
                    "`wandb sync %s`.", timeout, getattr(run, "dir", "<run dir>"))
     return False
+
+
+def finish_tracking_or_exit(timeout=FINISH_TIMEOUT_S, exit_code=0):
+    """For a process that is about to exit: finish W&B within `timeout`, or end the process right away
+    with `exit_code` (a failed run keeps its non-zero status).
+
+    W&B's own exit hook would otherwise call wandb.finish() again and wait for the stalled upload; on 11/05
+    the driver of finished runs hung there for 10+ minutes after writing training_status.json.
+    """
+    if not finish_tracking(timeout):
+        import traceback
+
+        if sys.exc_info()[0] is not None:
+            traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
 
 
 # TODO further refactor, e.g. put TensorBoard init to the "init" part

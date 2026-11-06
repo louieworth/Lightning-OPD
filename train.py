@@ -195,7 +195,13 @@ def train(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    failed = True
     try:
         train(args)
+        failed = False
     finally:
         ray.shutdown()
+        # The driver's own W&B run: finish it within a bound instead of in W&B's unbounded exit hook.
+        from slime.utils.tracking_utils import finish_tracking_or_exit
+
+        finish_tracking_or_exit(exit_code=1 if failed else 0)
