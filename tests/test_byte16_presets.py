@@ -36,7 +36,8 @@ PAIRS = {
 }
 PRESETS = {f"byte16_{pair}_{k}.yaml": (pair, k) for pair in PAIRS for k in ("k1", "k40", "k120")}
 # User request 11/06: K=20 for the 0.6B and 1.7B base students only.
-K20_PAIRS = ("qwen3_0_6b_base_nt_teacher_4b_instruct_2507", "qwen3_1_7b_base_nt_teacher_4b_instruct_2507")
+K20_PAIRS = ("qwen3_0_6b_base_nt_teacher_4b_instruct_2507", "qwen3_1_7b_base_nt_teacher_4b_instruct_2507",
+             "qwen3_4b_base_nt_teacher_4b_instruct_2507")
 PRESETS.update({f"byte16_{pair}_k20.yaml": (pair, "k20") for pair in K20_PAIRS})
 # Lightning presets and their number of current-policy rollout blocks (policy_rollout_k).
 LIGHTNING_K = {"k1": 1, "k20": 20, "k40": 40}
@@ -53,7 +54,7 @@ APPROVED_THROUGHPUT = {"sglang_max_running_requests": 64, "sglang_server_concurr
 # D k40 trains the same actor on the same 4 GPUs (resident layout, user decision 11/03).
 APPROVED_MEMORY = {f"byte16_{pair}_{k}.yaml": {"train_env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}
                    for pair in ("r1_distill_qwen_7b_teacher_light_r1_14b", "qwen3_4b_base_nt_teacher_4b_instruct_2507")
-                   for k in ("k40", "k120")}
+                   for k in ("k20", "k40", "k120")}
 
 
 # Base students (user decisions 11/04-11/05); the instruct and R1 presets keep their settings.
