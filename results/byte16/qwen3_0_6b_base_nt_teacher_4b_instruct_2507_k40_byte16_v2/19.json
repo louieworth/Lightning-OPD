@@ -1,0 +1,15 @@
+{
+  "eval/amc23/avg@8": 0.046875,
+  "eval/amc23/pass@8": 0.275,
+  "eval_metric/amc23-response-length": 4071.2,
+  "eval/aime26/avg@8": 0.0,
+  "eval/aime26/pass@8": 0.0,
+  "eval_metric/aime26-response-length": 4770.329166666666,
+  "eval/hmmt26/avg@8": 0.0,
+  "eval/hmmt26/pass@8": 0.0,
+  "eval_metric/hmmt26-response-length": 4503.94696969697,
+  "eval/gpqa_diamond/avg@8": 0.01744186046511628,
+  "eval/gpqa_diamond/pass@8": 0.11627906976744186,
+  "eval_metric/gpqa_diamond_physics-response-length": 4541.030523255814,
+  "_eval_completed_steps": 20
+}

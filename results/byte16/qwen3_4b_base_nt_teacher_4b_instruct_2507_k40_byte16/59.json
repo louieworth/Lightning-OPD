@@ -1,0 +1,15 @@
+{
+  "eval/aime24/avg@8": 0.15416666666666667,
+  "eval/aime24/pass@8": 0.4,
+  "eval_metric/aime24-response-length": 25766.4,
+  "eval/aime25/avg@8": 0.14166666666666666,
+  "eval/aime25/pass@8": 0.3333333333333333,
+  "eval_metric/aime25-response-length": 25105.291666666668,
+  "eval/aime26/avg@8": 0.09166666666666666,
+  "eval/aime26/pass@8": 0.3,
+  "eval_metric/aime26-response-length": 25418.358333333334,
+  "eval/hmmt26/avg@8": 0.07196969696969698,
+  "eval/hmmt26/pass@8": 0.18181818181818182,
+  "eval_metric/hmmt26-response-length": 24037.223484848484,
+  "_eval_completed_steps": 60
+}
